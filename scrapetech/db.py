@@ -129,3 +129,76 @@ def insert_signal(channel_id: int, message_id: int, mint: str, confidence: int, 
             (channel_id, message_id, mint, confidence),
         )
         return int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+def get_or_create_user(telegram_user_id: str, db_path: str = DEFAULT_DB_PATH) -> int:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute("INSERT OR IGNORE INTO users (telegram_user_id) VALUES (?)", (telegram_user_id,))
+        row = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", (telegram_user_id,)).fetchone()
+        return int(row["id"])
+
+def upsert_subscription(telegram_user_id: str, channel_handle: str, status: str = "ACTIVE", db_path: str = DEFAULT_DB_PATH) -> None:
+    user_id = get_or_create_user(telegram_user_id, db_path=db_path)
+    channel_id = get_or_create_channel(channel_handle, db_path=db_path)
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO subscriptions (user_id, channel_id, status)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, channel_id) DO UPDATE SET status=excluded.status
+            """,
+            (user_id, channel_id, status),
+        )
+
+def list_subscriptions(telegram_user_id: str, db_path: str = DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect(db_path) as conn:
+        user = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", (telegram_user_id,)).fetchone()
+        if not user:
+            return []
+        rows = conn.execute(
+            """
+            SELECT c.handle, s.status, s.created_at
+            FROM subscriptions s
+            JOIN channels c ON c.id = s.channel_id
+            WHERE s.user_id=?
+            ORDER BY c.handle
+            """,
+            (user["id"],),
+        ).fetchall()
+        return rows
+
+def active_subscribers_for_channel(channel_handle: str, db_path: str = DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect(db_path) as conn:
+        chan = conn.execute("SELECT id FROM channels WHERE handle=?", (channel_handle,)).fetchone()
+        if not chan:
+            return []
+        rows = conn.execute(
+            """
+            SELECT u.telegram_user_id
+            FROM subscriptions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.channel_id=? AND s.status='ACTIVE'
+            """,
+            (chan["id"],),
+        ).fetchall()
+        return [r["telegram_user_id"] for r in rows]
+
+def active_subscribers_for_channel(channel_handle: str, db_path: str = DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect(db_path) as conn:
+        chan = conn.execute("SELECT id FROM channels WHERE handle=?", (channel_handle,)).fetchone()
+        if not chan:
+            return []
+        rows = conn.execute(
+            """
+            SELECT u.telegram_user_id
+            FROM subscriptions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.channel_id=? AND s.status='ACTIVE'
+            """,
+            (chan["id"],),
+        ).fetchall()
+        return [r["telegram_user_id"] for r in rows]

@@ -2,7 +2,7 @@ import logging
 from telethon import TelegramClient, events
 from .config import Settings
 from .detector import detect_mints
-from .db import get_or_create_channel, insert_message, insert_signal
+from .db import get_or_create_channel, insert_message, insert_signal, active_subscribers_for_channel
 
 log = logging.getLogger("scrapetech")
 
@@ -39,6 +39,12 @@ async def run_listen(channel: str) -> None:
         for dm in detect_mints(text):
             log.info("DETECTED mint=%s confidence=%s", dm.mint, dm.confidence)
             insert_signal(channel_id=channel_id, message_id=message_id, mint=dm.mint, confidence=int(dm.confidence))
+
+            users = active_subscribers_for_channel(channel)
+            if users:
+                log.info("ROUTE mint=%s -> users=%s", dm.mint, users)
+            else:
+                log.info("ROUTE mint=%s -> users=[] (no active subscribers)", dm.mint)
 
     log.info("Listening on %s", channel)
     await client.run_until_disconnected()
