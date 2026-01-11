@@ -1,0 +1,102 @@
+import os
+import sqlite3
+from contextlib import contextmanager
+from typing import Iterator
+
+DEFAULT_DB_PATH = os.getenv("SCRAPETECH_DB", "scrapetech.db")
+
+@contextmanager
+def connect(db_path: str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    with connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_user_id TEXT UNIQUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            handle TEXT UNIQUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ACTIVE', -- ACTIVE | PAUSED | STOPPED | DELETED
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, channel_id),
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(channel_id) REFERENCES channels(id)
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER NOT NULL,
+            telegram_message_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(channel_id, telegram_message_id),
+            FOREIGN KEY(channel_id) REFERENCES channels(id)
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            mint TEXT NOT NULL,
+            confidence INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(channel_id) REFERENCES channels(id),
+            FOREIGN KEY(message_id) REFERENCES messages(id)
+        );
+        """)
+
+def smoke(db_path: str = DEFAULT_DB_PATH) -> None:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute("INSERT OR IGNORE INTO users (telegram_user_id) VALUES (?)", ("12345",))
+        conn.execute("INSERT OR IGNORE INTO channels (handle) VALUES (?)", ("@thewhitetest",))
+
+        user_id = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", ("12345",)).fetchone()["id"]
+        channel_id = conn.execute("SELECT id FROM channels WHERE handle=?", ("@thewhitetest",)).fetchone()["id"]
+
+        conn.execute("""
+        INSERT OR IGNORE INTO subscriptions (user_id, channel_id, status)
+        VALUES (?, ?, 'ACTIVE')
+        """, (user_id, channel_id))
+
+        row = conn.execute("""
+        SELECT u.telegram_user_id, c.handle, s.status
+        FROM subscriptions s
+        JOIN users u ON u.id = s.user_id
+        JOIN channels c ON c.id = s.channel_id
+        WHERE u.telegram_user_id=? AND c.handle=?
+        """, ("12345", "@thewhitetest")).fetchone()
+
+        if not row:
+            raise RuntimeError("Smoke test failed: no subscription row found")
+
+        print(f"DB SMOKE OK: user={row['telegram_user_id']} channel={row['handle']} status={row['status']}")
