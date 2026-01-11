@@ -146,3 +146,41 @@ def wallet_get_pubkey(telegram_user_id: str) -> Optional[str]:
     with connect() as conn:
         row = conn.execute("SELECT pubkey FROM wallets WHERE user_id=?", (user_id,)).fetchone()
         return row["pubkey"] if row else None
+
+
+from solders.keypair import Keypair
+
+
+
+from solders.keypair import Keypair
+
+def wallet_get_keypair(telegram_user_id: str) -> Keypair:
+    """
+    Decrypts the stored wallet seed and returns a Solders Keypair
+    """
+    pw = _get_password()
+    user_id = get_or_create_user(telegram_user_id)
+
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT enc_secret, salt FROM wallets WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+
+    if not row:
+        raise ValueError("Wallet not found for user")
+
+    enc = row["enc_secret"]
+    salt = row["salt"]
+
+    f = Fernet(_derive_fernet_key(pw, salt))
+    seed = f.decrypt(enc)   # 32 bytes
+
+    sk = SigningKey(seed)
+    # Use raw 32-byte pubkey bytes (matches wallet_create export)
+    pub_bytes = sk.verify_key.encode()
+
+    # Solana Keypair expects 64 bytes = seed + pubkey
+    secret64 = seed + pub_bytes
+    return Keypair.from_bytes(secret64)
