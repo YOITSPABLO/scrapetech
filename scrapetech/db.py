@@ -100,3 +100,32 @@ def smoke(db_path: str = DEFAULT_DB_PATH) -> None:
             raise RuntimeError("Smoke test failed: no subscription row found")
 
         print(f"DB SMOKE OK: user={row['telegram_user_id']} channel={row['handle']} status={row['status']}")
+
+def get_or_create_channel(handle: str, db_path: str = DEFAULT_DB_PATH) -> int:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute("INSERT OR IGNORE INTO channels (handle) VALUES (?)", (handle,))
+        row = conn.execute("SELECT id FROM channels WHERE handle=?", (handle,)).fetchone()
+        return int(row["id"])
+
+def insert_message(channel_id: int, telegram_message_id: int, text: str, db_path: str = DEFAULT_DB_PATH) -> int:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO messages (channel_id, telegram_message_id, text) VALUES (?, ?, ?)",
+            (channel_id, telegram_message_id, text),
+        )
+        row = conn.execute(
+            "SELECT id FROM messages WHERE channel_id=? AND telegram_message_id=?",
+            (channel_id, telegram_message_id),
+        ).fetchone()
+        return int(row["id"])
+
+def insert_signal(channel_id: int, message_id: int, mint: str, confidence: int, db_path: str = DEFAULT_DB_PATH) -> int:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO signals (channel_id, message_id, mint, confidence) VALUES (?, ?, ?, ?)",
+            (channel_id, message_id, mint, confidence),
+        )
+        return int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
