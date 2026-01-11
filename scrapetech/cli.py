@@ -10,6 +10,7 @@ from .db import (
     tail_trade_intents,
 )
 from .wallets import wallet_create, wallet_import, wallet_get_pubkey
+from .trade import build_buy_plan, print_buy_plan
 
 def main():
     parser = argparse.ArgumentParser("scrapetech")
@@ -75,6 +76,14 @@ def main():
     w_import.add_argument("--secret", required=True, help="base58 seed/secret or JSON array")
     w_show = w_sub.add_parser("show")
     w_show.add_argument("--user", required=True)
+
+    # trade (dry-run)
+    p_t = sub.add_parser("trade", help="Manual trading (dry-run for now)")
+    t_sub = p_t.add_subparsers(dest="tcmd", required=True)
+    t_buy = t_sub.add_parser("buy", help="Build a buy plan (dry-run)")
+    t_buy.add_argument("--user", required=True)
+    t_buy.add_argument("--mint", required=True)
+    t_buy.add_argument("--dry-run", action="store_true", default=True)
 
     args = parser.parse_args()
 
@@ -207,11 +216,11 @@ def main():
             print(f"WALLET OK: user={args.user} pubkey={out['pubkey']}")
             print("\nBACKUP OPTIONS (SAVE ONE OF THESE):")
             print("1) Phantom secret key (base58, 64 bytes) — Phantom-friendly:")
-            print(out['phantom_secret_base58'])
+            print(out["phantom_secret_base58"])
             print("\n2) Phantom secret key (JSON array, 64 ints) — also Phantom-friendly:")
-            print(out['phantom_secret_json'])
+            print(out["phantom_secret_json"])
             print("\n3) Seed (base58, 32 bytes) — dev format:")
-            print(out['seed_base58'])
+            print(out["seed_base58"])
             return
         if args.wcmd == "import":
             rec = wallet_import(args.user, args.secret)
@@ -223,4 +232,10 @@ def main():
                 print("No wallet found.")
                 return
             print(f"user={args.user} pubkey={pub}")
+            return
+
+    if args.command == "trade":
+        if args.tcmd == "buy":
+            plan = build_buy_plan(args.user, args.mint)
+            print_buy_plan(plan, dry_run=True)
             return
