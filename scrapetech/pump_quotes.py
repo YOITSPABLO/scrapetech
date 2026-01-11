@@ -7,7 +7,7 @@ from typing import Optional, Any
 
 from solders.pubkey import Pubkey
 
-from .solana_rpc import get_client
+from .solana_rpc import get_client, try_get_mint_decimals
 
 
 # Pump.fun program id (mainnet) per Solscan
@@ -35,7 +35,14 @@ class PumpQuoteBuy:
     fee_lamports: int
     lamports_in_after_fee: int
     est_tokens_out_raw: int
-    est_price_sol_per_token: Optional[float]
+
+    # If we can read mint decimals, also provide a UI-friendly amount
+    mint_decimals: int | None
+    est_tokens_out_ui: float | None
+
+    # Optional spot estimate derived from virtual reserves
+    est_price_sol_per_token: float | None
+
     curve_complete: bool
     curve_pda: str
     creator: str
@@ -149,6 +156,8 @@ def quote_buy_pumpfun(mint: str, sol_in: float, fee_bps: int = 0) -> PumpQuoteBu
     fee_lamports = (lamports_in * int(fee_bps)) // 10_000
     x = max(0, lamports_in - fee_lamports)
 
+    mint_decimals = try_get_mint_decimals(mint)
+
     curve_pda = get_bonding_curve_pda(mint)
     data = _get_account_data(curve_pda)
     st = decode_bonding_curve_state(data)
@@ -164,6 +173,10 @@ def quote_buy_pumpfun(mint: str, sol_in: float, fee_bps: int = 0) -> PumpQuoteBu
     if st.virtual_token_reserves > 0 and st.virtual_sol_reserves > 0:
         price = (st.virtual_sol_reserves / 1_000_000_000) / st.virtual_token_reserves
 
+    est_ui = None
+    if mint_decimals is not None and est_out is not None:
+        est_ui = float(est_out) / (10 ** int(mint_decimals))
+
     return PumpQuoteBuy(
         mint=mint,
         route="pumpfun",
@@ -172,6 +185,8 @@ def quote_buy_pumpfun(mint: str, sol_in: float, fee_bps: int = 0) -> PumpQuoteBu
         fee_lamports=fee_lamports,
         lamports_in_after_fee=x,
         est_tokens_out_raw=int(est_out),
+        mint_decimals=mint_decimals,
+        est_tokens_out_ui=est_ui,
         est_price_sol_per_token=price,
         curve_complete=st.complete,
         curve_pda=str(curve_pda),
