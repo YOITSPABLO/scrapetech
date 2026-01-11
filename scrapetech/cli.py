@@ -1,16 +1,31 @@
+from solders.pubkey import Pubkey
 import argparse
 import asyncio
 import os
+
 from .logging_setup import setup_logging
 from .telethon_listener import run_listen
+
 from .db import (
     init_db, smoke, connect,
     upsert_subscription, list_subscriptions,
     update_user_settings, get_user_settings,
     tail_trade_intents,
 )
+
 from .wallets import wallet_create, wallet_import, wallet_get_pubkey
 from .trade import build_buy_plan, print_buy_plan
+
+# Pump.fun quoting + tx building/sim
+from .pump_quotes import quote_buy_pumpfun
+from .pump_tx import (
+    load_keypair_for_user,
+    build_buy_ix_and_plan,
+    build_and_simulate_buy_tx,
+    send_buy_tx,
+    dump_ix_accounts,
+)
+
 
 def main():
     parser = argparse.ArgumentParser("scrapetech")
@@ -77,13 +92,45 @@ def main():
     w_show = w_sub.add_parser("show")
     w_show.add_argument("--user", required=True)
 
-    # trade (dry-run)
-    p_t = sub.add_parser("trade", help="Manual trading (dry-run for now)")
+    # trade (dry-run plan)
+    p_t = sub.add_parser("trade", help="Manual trading (dry-run plan)")
     t_sub = p_t.add_subparsers(dest="tcmd", required=True)
     t_buy = t_sub.add_parser("buy", help="Build a buy plan (dry-run)")
     t_buy.add_argument("--user", required=True)
     t_buy.add_argument("--mint", required=True)
-    t_buy.add_argument("--dry-run", action="store_true", default=True)
+
+    # exec (pumpfun)
+    p_e = sub.add_parser("exec", help="Pump.fun execution (quote/build/sim/dump)")
+    e_sub = p_e.add_subparsers(dest="ecmd", required=True)
+
+    e_quote_buy = e_sub.add_parser("quote-buy", help="Quote a buy (no tx sent)")
+    e_quote_buy.add_argument("--user", required=True)
+    e_quote_buy.add_argument("--mint", required=True)
+    e_quote_buy.add_argument("--sol", type=float, default=None)
+
+    e_build_buy = e_sub.add_parser("build-buy", help="Build Pump.fun buy instruction (no tx)")
+    e_build_buy.add_argument("--user", required=True)
+    e_build_buy.add_argument("--mint", required=True)
+    e_build_buy.add_argument("--sol", type=float, default=None)
+    e_build_buy.add_argument("--slippage", type=float, default=None)
+
+    e_sim_buytx = e_sub.add_parser("simulate-buytx", help="Simulate Pump.fun buy tx (no send)")
+
+    e_send_buy = e_sub.add_parser("send-buy", help="SEND Pump.fun buy tx (REAL TX)")
+    e_send_buy.add_argument("--user", required=True)
+    e_send_buy.add_argument("--mint", required=True)
+    e_send_buy.add_argument("--sol", type=float, default=None)
+    e_send_buy.add_argument("--slippage", type=float, default=None)
+    e_sim_buytx.add_argument("--user", required=True)
+    e_sim_buytx.add_argument("--mint", required=True)
+    e_sim_buytx.add_argument("--sol", type=float, default=None)
+    e_sim_buytx.add_argument("--slippage", type=float, default=None)
+
+    e_dump_buytx = e_sub.add_parser("dump-buytx", help="Dump tx account order + existence")
+    e_dump_buytx.add_argument("--user", required=True)
+    e_dump_buytx.add_argument("--mint", required=True)
+    e_dump_buytx.add_argument("--sol", type=float, default=None)
+    e_dump_buytx.add_argument("--slippage", type=float, default=None)
 
     args = parser.parse_args()
 
@@ -239,3 +286,176 @@ def main():
             plan = build_buy_plan(args.user, args.mint)
             print_buy_plan(plan, dry_run=True)
             return
+
+    if args.command == "exec":
+        # quote-buy
+        if args.ecmd == "quote-buy":
+            from .db import get_or_create_user
+            get_or_create_user(args.user)
+            s = get_user_settings(args.user)
+            sol_in = float(args.sol) if args.sol is not None else float(s["buy_amount_sol"])
+            q = quote_buy_pumpfun(args.mint, sol_in=sol_in, fee_bps=0)
+
+            print("=== Scrapetech Quote Buy ===")
+            print(f"USER: {args.user}")
+            print(f"MINT: {q.mint}")
+            print(f"ROUTE: {q.route}")
+            print(f"SOL IN: {q.sol_in}")
+            print(f"EST TOKENS OUT (raw units): {q.est_tokens_out_raw}")
+            if getattr(q, "mint_decimals", None) is not None and getattr(q, "est_tokens_out_ui", None) is not None:
+                print(f"EST TOKENS OUT (UI): {q.est_tokens_out_ui:,.6f} (decimals={q.mint_decimals})")
+            if getattr(q, "est_price_sol_per_token", None) is not None and getattr(q, "est_tokens_out_ui", None):
+                if q.est_tokens_out_ui and q.est_tokens_out_ui > 0:
+                    sol_per_token = q.sol_in / q.est_tokens_out_ui
+                    tokens_per_sol = q.est_tokens_out_ui / q.sol_in
+                    print(f"PRICE: {sol_per_token:.12f} SOL per token")
+                    print(f"PRICE: {tokens_per_sol:,.2f} tokens per SOL")
+            if getattr(q, "token_program", None) is not None:
+                print(f"TOKEN PROGRAM: {q.token_program}")
+            print(f"CURVE PDA: {q.curve_pda}")
+            print(f"CREATOR: {q.creator}")
+            print(f"CURVE COMPLETE: {q.curve_complete}")
+            print("NO TRANSACTION SENT.")
+            return
+
+        # build-buy
+        if args.ecmd == "build-buy":
+            from .db import get_or_create_user
+            get_or_create_user(args.user)
+            settings = get_user_settings(args.user)
+            sol_in = float(args.sol) if args.sol is not None else float(settings["buy_amount_sol"])
+            sl = float(args.slippage) if args.slippage is not None else float(settings["buy_slippage_pct"])
+
+            kp = load_keypair_for_user(args.user)
+            plan, _ix = build_buy_ix_and_plan(user_keypair=kp, mint_str=args.mint, sol_in=sol_in, slippage_pct=sl)
+
+            print("=== Scrapetech Build Buy (Pump.fun) ===")
+            print(f"USER: {args.user}")
+            print(f"WALLET: {plan.user_pubkey}")
+            print(f"MINT: {plan.mint}")
+            print(f"TOKEN PROGRAM: {plan.token_program}")
+            print(f"BONDING CURVE: {plan.bonding_curve}")
+            print(f"ASSOCIATED USER: {user_ata}")
+            print(f"TOKENS OUT (raw): {plan.tokens_out_raw}")
+            print(f"MAX SOL COST (lamports): {plan.max_sol_cost_lamports} (slippage={plan.slippage_pct}%)")
+            print("NO TRANSACTION SENT.")
+            return
+
+        # simulate-buytx
+        if args.ecmd == "simulate-buytx":
+            from .db import get_or_create_user
+            get_or_create_user(args.user)
+            settings = get_user_settings(args.user)
+            sol_in = float(args.sol) if args.sol is not None else float(settings["buy_amount_sol"])
+            sl = float(args.slippage) if args.slippage is not None else float(settings["buy_slippage_pct"])
+
+            kp = load_keypair_for_user(args.user)
+            out = build_and_simulate_buy_tx(user_keypair=kp, mint_str=args.mint, sol_in=sol_in, slippage_pct=sl)
+
+            plan = out["plan"]
+            sim = out["simulate"]
+
+            print("=== Scrapetech Simulate Buy TX (Pump.fun) ===")
+            print(f"USER: {args.user}")
+            print(f"WALLET: {plan.user_pubkey}")
+            print(f"MINT: {plan.mint}")
+            print(f"TOKEN PROGRAM: {plan.token_program}")
+            print(f"TOKENS OUT (raw): {plan.tokens_out_raw}")
+            print(f"MAX SOL COST (lamports): {plan.max_sol_cost_lamports} (slippage={plan.slippage_pct}%)")
+            print(f"SIM ERR: {getattr(sim, 'err', None)}")
+            logs = getattr(sim, "logs", None)
+            if logs:
+                print("---- LOGS ----")
+                for line in logs:
+                    print(line)
+            print("NO TRANSACTION SENT.")
+            return
+
+
+        # send-buy (REAL SEND)
+        if args.ecmd == "send-buy":
+            from .db import get_or_create_user
+            get_or_create_user(args.user)
+            settings = get_user_settings(args.user)
+
+            sol_in = float(args.sol) if args.sol is not None else float(settings["buy_amount_sol"])
+            sl = float(args.slippage) if args.slippage is not None else float(settings["buy_slippage_pct"])
+
+            kp = load_keypair_for_user(args.user)
+            out = send_buy_tx(user_keypair=kp, mint_str=args.mint, sol_in=sol_in, slippage_pct=sl)
+
+            plan = out["plan"]
+            sig = out["sig"]
+
+            print("=== Scrapetech SEND BUY (Pump.fun) ===")
+            print(f"USER: {args.user}")
+            print(f"WALLET: {plan.user_pubkey}")
+            print(f"MINT: {plan.mint}")
+            print(f"TOKEN PROGRAM: {plan.token_program}")
+            print(f"TOKENS OUT (raw): {plan.tokens_out_raw}")
+            print(f"MAX SOL COST (lamports): {plan.max_sol_cost_lamports} (slippage={plan.slippage_pct}%)")
+            print(f"SIGNATURE: {sig}")
+            if sig:
+                print(f"SOLSCAN: https://solscan.io/tx/{sig}")
+            return
+
+        # dump-buytx
+        if args.ecmd == "dump-buytx":
+            from .db import get_or_create_user
+            from .pump_tx import build_buy_ix_and_plan, ata_create_idempotent_ix, dump_ix_accounts
+            from .solana_rpc import get_http_client, rpc_get_multiple_accounts
+        
+            get_or_create_user(args.user)
+            settings = get_user_settings(args.user)
+            sol_in = float(args.sol) if args.sol is not None else float(settings["buy_amount_sol"])
+            sl = float(args.slippage) if args.slippage is not None else float(settings["buy_slippage_pct"])
+        
+            kp = load_keypair_for_user(args.user)
+            plan, buy_ix = build_buy_ix_and_plan(user_keypair=kp, mint_str=args.mint, sol_in=sol_in, slippage_pct=sl)
+        
+            owner = kp.pubkey()
+            mint = Pubkey.from_string(args.mint)
+            token_program = Pubkey.from_string(str(plan.token_program))
+            from spl.token.instructions import get_associated_token_address
+            mint_pk = Pubkey.from_string(args.mint)
+            owner = Pubkey.from_string(str(plan.user_pubkey))
+            token_prog = Pubkey.from_string(str(plan.token_program))
+            user_ata = get_associated_token_address(owner=owner, mint=mint_pk, token_program_id=token_prog)
+            bonding_curve = Pubkey.from_string(str(plan.bonding_curve))
+            assoc_bonding_curve = get_associated_token_address(owner=bonding_curve, mint=mint_pk, token_program_id=token_prog)
+            ata_ix = ata_create_idempotent_ix(owner, owner, mint, user_ata, token_program)
+        
+            # collect all pubkeys referenced by both ixs (ATA + buy)
+            all_pubkeys = []
+            for ix in (ata_ix, buy_ix):
+                for _i, _sig, _w, pk in dump_ix_accounts(ix):
+                    if pk not in all_pubkeys:
+                        all_pubkeys.append(pk)
+        
+            http = get_http_client()
+            vals = rpc_get_multiple_accounts(http, all_pubkeys)
+            missing = set(pk for pk, v in zip(all_pubkeys, vals) if v is None)
+        
+            print("=== Scrapetech Dump BuyTX ===")
+            print(f"USER: {args.user}")
+            print(f"WALLET: {plan.user_pubkey}")
+            print(f"MINT: {plan.mint}")
+            print(f"TOKEN PROGRAM: {plan.token_program}")
+        
+            if missing:
+                print("\nMISSING (nonexistent) pubkeys:")
+                for pk in sorted(missing):
+                    print(f"  - {pk}")
+        
+            def _dump(ix, idx):
+                print(f"\nIX {idx} program={ix.program_id}")
+                for i, is_sig, is_w, pk in dump_ix_accounts(ix):
+                    status = "MISSING" if pk in missing else "OK"
+                    flags = ("W" if is_w else "-") + ("S" if is_sig else "-")
+                    print(f"  [{i:02d}] {status} {flags} {pk}")
+        
+            _dump(ata_ix, 0)
+            _dump(buy_ix, 1)
+            return
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import base64
 import struct
 from dataclasses import dataclass
@@ -257,3 +258,58 @@ def build_and_simulate_buy_tx(
 
 def load_keypair_for_user(telegram_user_id: str) -> Keypair:
     return wallet_get_keypair(telegram_user_id)
+
+
+def send_buy_tx(user_keypair: Keypair, mint_str: str, sol_in: float, slippage_pct: float):
+    """
+    Build and SEND a Pump.fun buy transaction.
+    Returns {"plan": plan, "sig": signature, "tx": VersionedTransaction}.
+    """
+    import base64
+
+    # 1) Build instructions + plan
+    plan, buy_ix = build_buy_ix_and_plan(user_keypair, mint_str, sol_in, slippage_pct)
+
+    # 2) Build ATA create (idempotent) for the user
+    owner = user_keypair.pubkey()
+    mint = Pubkey.from_string(mint_str)
+    user_ata = Pubkey.from_string(str(plan.user_ata)) if hasattr(plan, "user_ata") else Pubkey.from_string(str(plan.user_token_account)) if hasattr(plan, "user_token_account") else None
+    if user_ata is None:
+        # fallback: compute ATA using spl helper already used elsewhere in this file (if present)
+        try:
+            from spl.token.instructions import get_associated_token_address
+            user_ata = get_associated_token_address(owner, mint, Pubkey.from_string(str(plan.token_program)))
+        except Exception as e:
+            raise RuntimeError("Could not determine user ATA from plan") from e
+
+    token_program = Pubkey.from_string(str(plan.token_program))
+    ata_ix = ata_create_idempotent_ix(owner, owner, mint, user_ata, token_program)
+
+    # 3) Build tx
+    http = get_http_client()
+    bh = rpc_get_latest_blockhash(http)
+    # bh may be dict or str depending on your rpc helper
+    if isinstance(bh, dict):
+        # common shape: {"blockhash": "..."}
+        bh = bh.get("blockhash") or bh.get("value", {}).get("blockhash")
+    if not isinstance(bh, str):
+        raise RuntimeError(f"Unexpected latest blockhash type: {type(bh)} -> {bh}")
+    bh = bh.strip()
+    msg = MessageV0.try_compile(owner, [ata_ix, buy_ix], [], Hash.from_string(bh))
+    tx = VersionedTransaction(msg, [user_keypair])
+
+    # 4) Send via RPC (base64 encoding)
+    rpc_url = _rpc_url().strip()
+    tx_b64 = base64.b64encode(bytes(tx)).decode("utf-8")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [tx_b64, {"encoding":"base64","skipPreflight":True,"maxRetries":3,"preflightCommitment":"processed"}],
+    }
+    r = http.post(rpc_url, json=payload, timeout=30.0)
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(f"sendTransaction error: {j['error']}")
+    sig = j.get("result")
+    return {"plan": plan, "sig": sig, "tx": tx}
