@@ -90,6 +90,8 @@ def _settings_menu():
         [Button.inline("Buy Slippage", b"set:buy_slippage"), Button.inline("Sell Slippage", b"set:sell_slippage")],
         [Button.inline("Toggle TP/SL", b"set:tp_sl_toggle")],
         [Button.inline("Take Profit %", b"set:take_profit"), Button.inline("Stop Loss %", b"set:stop_loss")],
+        [Button.inline("Allow Auto Buy", b"set:auto_buy_toggle"), Button.inline("Duplicate Buy", b"set:dup_toggle")],
+        [Button.inline("Scraper Settings", b"menu:channels")],
         [Button.inline("Back", b"menu:main")],
     ]
 
@@ -395,7 +397,9 @@ async def run_bot() -> None:
                 f"sell_slippage_pct={s.get('sell_slippage_pct')}\n"
                 f"tp_sl_enabled={s.get('tp_sl_enabled')}\n"
                 f"take_profit_pct={s.get('take_profit_pct')}\n"
-                f"stop_loss_pct={s.get('stop_loss_pct')}",
+                f"stop_loss_pct={s.get('stop_loss_pct')}\n"
+                f"auto_buy_enabled={s.get('auto_buy_enabled', 1)}\n"
+                f"duplicate_mint_block={s.get('duplicate_mint_block')}",
                 buttons=_settings_menu(),
             )
             return
@@ -504,6 +508,18 @@ async def run_bot() -> None:
             new_val = 0 if int(s.get("tp_sl_enabled", 1)) else 1
             update_user_settings(user_id, {"tp_sl_enabled": new_val})
             await event.edit(f"TP/SL enabled={new_val}", buttons=_settings_menu())
+            return
+        if data == "set:auto_buy_toggle":
+            s = get_user_settings(user_id)
+            new_val = 0 if int(s.get("auto_buy_enabled", 1)) else 1
+            update_user_settings(user_id, {"auto_buy_enabled": new_val})
+            await event.edit(f"Auto buy enabled={new_val}", buttons=_settings_menu())
+            return
+        if data == "set:dup_toggle":
+            s = get_user_settings(user_id)
+            new_val = 0 if int(s.get("duplicate_mint_block", 1)) else 1
+            update_user_settings(user_id, {"duplicate_mint_block": new_val})
+            await event.edit(f"Duplicate block={new_val}", buttons=_settings_menu())
             return
         if data == "set:take_profit":
             pending[user_id] = {"mode": "setting_value", "field": "take_profit_pct"}

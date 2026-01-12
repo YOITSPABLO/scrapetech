@@ -41,6 +41,8 @@ def _wait_for_deltas(signature: str, owner_pubkey: str, mint: str, retries: int 
 
 def auto_buy_for_user(telegram_user_id: str, mint: str, sol_in: Optional[float] = None) -> Optional[str]:
     settings = get_user_settings(telegram_user_id)
+    if not int(settings.get("auto_buy_enabled", 1)):
+        raise ValueError("Auto-buy is disabled for this user")
     sol_in = float(sol_in) if sol_in is not None else float(settings["buy_amount_sol"])
     slippage = float(settings["buy_slippage_pct"])
 

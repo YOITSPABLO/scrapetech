@@ -5,6 +5,12 @@ from typing import Iterator
 
 DEFAULT_DB_PATH = os.getenv("SCRAPETECH_DB", "scrapetech.db")
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if any(c["name"] == column for c in cols):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl};")
+
 @contextmanager
 def connect(db_path: str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(db_path)
@@ -96,6 +102,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
         """)
+        _ensure_column(conn, "user_settings", "auto_buy_enabled", "INTEGER NOT NULL DEFAULT 1")
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS trade_intents (
@@ -323,6 +330,7 @@ def update_user_settings(telegram_user_id: str, updates: dict, db_path: str = DE
         "buy_amount_sol","buy_slippage_pct","sell_slippage_pct",
         "tp_sl_enabled","take_profit_pct","stop_loss_pct",
         "cooldown_seconds","max_trades_per_day","duplicate_mint_block",
+        "auto_buy_enabled",
     }
     bad = [k for k in updates.keys() if k not in allowed]
     if bad:
