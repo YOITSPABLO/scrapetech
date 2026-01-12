@@ -246,6 +246,9 @@ async def run_bot() -> None:
         state = pending.get(user_id)
         if not state:
             return
+        prompt_id = state.get("prompt_id")
+        if prompt_id and event.message.reply_to_msg_id != prompt_id:
+            return
         if state.get("mode") == "buy":
             try:
                 mint, sol = _parse_buy_args(event.raw_text)
@@ -256,6 +259,15 @@ async def run_bot() -> None:
             await event.respond("Submitting buy...")
             sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
             await event.respond(f"Buy submitted: {sig}")
+            return
+
+        if state.get("mode") == "buy_mint":
+            mint = event.raw_text.strip()
+            if not mint:
+                await event.respond("Reply with a mint address.")
+                return
+            pending[user_id] = {"mode": "buy_amount", "mint": mint}
+            await event.respond(f"Select buy amount for {mint}:", buttons=_buy_amount_presets(mint))
             return
 
         if state.get("mode") == "sell":
@@ -287,15 +299,6 @@ async def run_bot() -> None:
                 await event.respond(f"WALLET OK: {rec.pubkey}", buttons=_wallet_menu())
             except Exception as e:
                 await event.respond(f"Import failed: {e}", buttons=_wallet_menu())
-            return
-
-        if state.get("mode") == "buy_mint":
-            mint = event.raw_text.strip()
-            if not mint:
-                await event.respond("Send a mint address.")
-                return
-            pending[user_id] = {"mode": "buy_amount", "mint": mint}
-            await event.respond(f"Select buy amount for {mint}:", buttons=_buy_amount_presets(mint))
             return
 
         if state.get("mode") == "buy_amount_custom":
@@ -402,7 +405,9 @@ async def run_bot() -> None:
             return
         if data == "wallet:import":
             pending[user_id] = {"mode": "import_wallet"}
-            await _safe_edit(event, "Reply with the secret key or seed to import.", buttons=_wallet_menu())
+            await _safe_edit(event, "Import wallet selected.", buttons=_wallet_menu())
+            msg = await event.respond("Reply with the secret key or seed to import:", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
             return
         if data == "menu:positions":
             rows = list_positions(user_id)
@@ -443,7 +448,9 @@ async def run_bot() -> None:
             return
         if data == "menu:buy":
             pending[user_id] = {"mode": "buy_mint"}
-            await _safe_edit(event, "Reply with the mint address to buy.", buttons=_main_menu())
+            await _safe_edit(event, "Buy selected.", buttons=_main_menu())
+            msg = await event.respond("Reply with the mint address to buy:", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
             return
         if data == "menu:sell":
             rows = list_positions(user_id)
@@ -464,7 +471,9 @@ async def run_bot() -> None:
             _tag, mint, amount = data.split(":")
             if amount == "custom":
                 pending[user_id] = {"mode": "buy_amount_custom", "mint": mint}
-                await _safe_edit(event, "Reply with custom SOL amount.", buttons=_main_menu())
+                await _safe_edit(event, "Custom amount selected.", buttons=_main_menu())
+                msg = await event.respond("Reply with custom SOL amount:", buttons=Button.force_reply())
+                pending[user_id]["prompt_id"] = msg.id
                 return
             sol = float(amount)
             await _safe_edit(
@@ -517,17 +526,23 @@ async def run_bot() -> None:
         if data == "set:buy_amount":
             pending[user_id] = {"mode": "setting_value", "field": "buy_amount_sol"}
             s = get_user_settings(user_id)
-            await _safe_edit(event, "Reply with new buy amount (SOL).", buttons=_settings_menu(s))
+            await _safe_edit(event, "Buy amount selected.", buttons=_settings_menu(s))
+            msg = await event.respond("Reply with new buy amount (SOL):", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
             return
         if data == "set:buy_slippage":
             pending[user_id] = {"mode": "setting_value", "field": "buy_slippage_pct"}
             s = get_user_settings(user_id)
-            await _safe_edit(event, "Reply with new buy slippage (%).", buttons=_settings_menu(s))
+            await _safe_edit(event, "Buy slippage selected.", buttons=_settings_menu(s))
+            msg = await event.respond("Reply with new buy slippage (%):", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
             return
         if data == "set:sell_slippage":
             pending[user_id] = {"mode": "setting_value", "field": "sell_slippage_pct"}
             s = get_user_settings(user_id)
-            await _safe_edit(event, "Reply with new sell slippage (%).", buttons=_settings_menu(s))
+            await _safe_edit(event, "Sell slippage selected.", buttons=_settings_menu(s))
+            msg = await event.respond("Reply with new sell slippage (%):", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
             return
         if data == "set:tp_sl_toggle":
             s = get_user_settings(user_id)
@@ -553,12 +568,16 @@ async def run_bot() -> None:
         if data == "set:take_profit":
             pending[user_id] = {"mode": "setting_value", "field": "take_profit_pct"}
             s = get_user_settings(user_id)
-            await _safe_edit(event, "Reply with take profit (%).", buttons=_settings_menu(s))
+            await _safe_edit(event, "Take profit selected.", buttons=_settings_menu(s))
+            msg = await event.respond("Reply with take profit (%):", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
             return
         if data == "set:stop_loss":
             pending[user_id] = {"mode": "setting_value", "field": "stop_loss_pct"}
             s = get_user_settings(user_id)
-            await _safe_edit(event, "Reply with stop loss (%).", buttons=_settings_menu(s))
+            await _safe_edit(event, "Stop loss selected.", buttons=_settings_menu(s))
+            msg = await event.respond("Reply with stop loss (%):", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
             return
 
         if data == "channels:list":
@@ -571,11 +590,15 @@ async def run_bot() -> None:
             return
         if data == "channels:add":
             pending[user_id] = {"mode": "channels_add"}
-            await _safe_edit(event, "Reply with a channel handle to add (e.g., @example).", buttons=_channels_menu())
+            await _safe_edit(event, "Add channel selected.", buttons=_channels_menu())
+            msg = await event.respond("Reply with a channel handle to add (e.g., @example):", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
             return
         if data == "channels:remove":
             pending[user_id] = {"mode": "channels_remove"}
-            await _safe_edit(event, "Reply with a channel handle to remove.", buttons=_channels_menu())
+            await _safe_edit(event, "Remove channel selected.", buttons=_channels_menu())
+            msg = await event.respond("Reply with a channel handle to remove:", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
             return
 
     await client.run_until_disconnected()
