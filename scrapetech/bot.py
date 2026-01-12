@@ -3,6 +3,7 @@ import asyncio
 from typing import Optional
 
 from telethon import TelegramClient, events, Button
+from telethon.errors import MessageNotModifiedError
 
 from .db import get_user_settings, list_positions, update_user_settings, list_subscriptions, upsert_subscription
 from .wallets import wallet_get_pubkey, wallet_create, wallet_import
@@ -135,6 +136,12 @@ async def run_bot() -> None:
     await client.start(bot_token=token)
 
     pending = {}
+
+    async def _safe_edit(event, text, buttons=None):
+        try:
+            await event.edit(text, buttons=buttons)
+        except MessageNotModifiedError:
+            await event.respond(text, buttons=buttons)
 
     @client.on(events.NewMessage(pattern=r"^/start"))
     async def _start(event):
@@ -378,7 +385,7 @@ async def run_bot() -> None:
             await event.edit(text, buttons=_wallet_menu())
             return
         if data == "wallet:generate":
-            await event.edit("Generating wallet...", buttons=_wallet_menu())
+            await _safe_edit(event, "Generating wallet...", buttons=_wallet_menu())
             try:
                 out = wallet_create(user_id)
                 await event.respond(
@@ -395,12 +402,12 @@ async def run_bot() -> None:
             return
         if data == "wallet:import":
             pending[user_id] = {"mode": "import_wallet"}
-            await event.edit("Send the secret key or seed to import.", buttons=_wallet_menu())
+            await _safe_edit(event, "Reply with the secret key or seed to import.", buttons=_wallet_menu())
             return
         if data == "menu:positions":
             rows = list_positions(user_id)
             if not rows:
-                await event.edit("No positions.", buttons=_main_menu())
+                await _safe_edit(event, "No positions.", buttons=_main_menu())
                 return
             lines = []
             for r in rows:
@@ -408,20 +415,20 @@ async def run_bot() -> None:
                     f"{r['mint']} | tokens={r['token_balance']} | avg_entry={r['avg_entry_sol']} | "
                     f"pnl={r['realized_pnl_sol']} | open={r['open']}"
                 )
-            await event.edit("\n".join(lines), buttons=_main_menu())
+            await _safe_edit(event, "\n".join(lines), buttons=_main_menu())
             return
         if data == "menu:settings":
             s = get_user_settings(user_id)
-            await event.edit(
+            await _safe_edit(
                 "Settings (tap a row, then reply with a value when prompted):",
                 buttons=_settings_menu(s),
             )
             return
         if data == "menu:channels":
-            await event.edit("Channel subscriptions:", buttons=_channels_menu())
+            await _safe_edit(event, "Channel subscriptions:", buttons=_channels_menu())
             return
         if data == "menu:help":
-            await event.edit(
+            await _safe_edit(
                 "Commands:\n"
                 "/buy <mint> [sol]\n"
                 "/sell <mint> <pct>\n"
@@ -434,31 +441,31 @@ async def run_bot() -> None:
             return
         if data == "menu:buy":
             pending[user_id] = {"mode": "buy_mint"}
-            await event.edit("Send a mint address to buy.", buttons=_main_menu())
+            await _safe_edit(event, "Reply with the mint address to buy.", buttons=_main_menu())
             return
         if data == "menu:sell":
             rows = list_positions(user_id)
             open_rows = [r for r in rows if float(r["token_balance"]) > 0]
             if not open_rows:
-                await event.edit("No positions to sell.", buttons=_main_menu())
+                await _safe_edit(event, "No positions to sell.", buttons=_main_menu())
                 return
             if len(open_rows) == 1:
                 mint = open_rows[0]["mint"]
-                await event.edit(f"Sell presets for {mint}:", buttons=_sell_presets(mint))
+                await _safe_edit(event, f"Sell presets for {mint}:", buttons=_sell_presets(mint))
                 return
             buttons = [[Button.inline(r["mint"][:8], f"sellpick:{r['mint']}".encode("utf-8"))] for r in open_rows]
             buttons.append([Button.inline("Back", b"menu:main")])
-            await event.edit("Select a mint:", buttons=buttons)
+            await _safe_edit(event, "Select a mint:", buttons=buttons)
             return
 
         if data.startswith("buyamt:"):
             _tag, mint, amount = data.split(":")
             if amount == "custom":
                 pending[user_id] = {"mode": "buy_amount_custom", "mint": mint}
-                await event.edit("Send custom SOL amount.", buttons=_main_menu())
+                await _safe_edit(event, "Reply with custom SOL amount.", buttons=_main_menu())
                 return
             sol = float(amount)
-            await event.edit(
+            await _safe_edit(
                 f"Confirm buy:\nMINT={mint}\nSOL={sol}",
                 buttons=_confirm_buttons(f"buy:{mint}:{sol}"),
             )
@@ -466,7 +473,7 @@ async def run_bot() -> None:
 
         if data.startswith("sellpick:"):
             mint = data.split(":", 1)[1]
-            await event.edit(f"Sell presets for {mint}:", buttons=_sell_presets(mint))
+            await _safe_edit(event, f"Sell presets for {mint}:", buttons=_sell_presets(mint))
             return
         if data.startswith("sell:"):
             _tag, mint, pct_s = data.split(":")
@@ -474,10 +481,10 @@ async def run_bot() -> None:
             pos = list_positions(user_id)
             row = next((r for r in pos if r["mint"] == mint), None)
             if not row or float(row["token_balance"]) <= 0:
-                await event.edit("No position balance found.", buttons=_main_menu())
+                await _safe_edit(event, "No position balance found.", buttons=_main_menu())
                 return
             tokens = float(row["token_balance"]) * (pct / 100.0)
-            await event.edit(
+            await _safe_edit(
                 f"Confirm sell:\nMINT={mint}\nPCT={pct}",
                 buttons=_confirm_buttons(f"sell:{mint}:{pct}"),
             )
@@ -488,7 +495,7 @@ async def run_bot() -> None:
             _tag, action, mint, amt = data.split(":")
             if action == "buy":
                 sol = float(amt)
-                await event.edit("Submitting buy...", buttons=_main_menu())
+                await _safe_edit(event, "Submitting buy...", buttons=_main_menu())
                 sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
                 await event.respond(f"Buy submitted: {sig}")
                 return
@@ -497,10 +504,10 @@ async def run_bot() -> None:
                 pos = list_positions(user_id)
                 row = next((r for r in pos if r["mint"] == mint), None)
                 if not row or float(row["token_balance"]) <= 0:
-                    await event.edit("No position balance found.", buttons=_main_menu())
+                    await _safe_edit(event, "No position balance found.", buttons=_main_menu())
                     return
                 tokens = float(row["token_balance"]) * (pct / 100.0)
-                await event.edit("Submitting sell...", buttons=_main_menu())
+                await _safe_edit(event, "Submitting sell...", buttons=_main_menu())
                 sig = await asyncio.to_thread(auto_sell_for_position, user_id, mint, tokens)
                 await event.respond(f"Sell submitted: {sig}")
                 return
@@ -508,65 +515,65 @@ async def run_bot() -> None:
         if data == "set:buy_amount":
             pending[user_id] = {"mode": "setting_value", "field": "buy_amount_sol"}
             s = get_user_settings(user_id)
-            await event.edit("Send new buy amount (SOL).", buttons=_settings_menu(s))
+            await _safe_edit(event, "Reply with new buy amount (SOL).", buttons=_settings_menu(s))
             return
         if data == "set:buy_slippage":
             pending[user_id] = {"mode": "setting_value", "field": "buy_slippage_pct"}
             s = get_user_settings(user_id)
-            await event.edit("Send new buy slippage (%)", buttons=_settings_menu(s))
+            await _safe_edit(event, "Reply with new buy slippage (%).", buttons=_settings_menu(s))
             return
         if data == "set:sell_slippage":
             pending[user_id] = {"mode": "setting_value", "field": "sell_slippage_pct"}
             s = get_user_settings(user_id)
-            await event.edit("Send new sell slippage (%)", buttons=_settings_menu(s))
+            await _safe_edit(event, "Reply with new sell slippage (%).", buttons=_settings_menu(s))
             return
         if data == "set:tp_sl_toggle":
             s = get_user_settings(user_id)
             new_val = 0 if int(s.get("tp_sl_enabled", 1)) else 1
             update_user_settings(user_id, {"tp_sl_enabled": new_val})
             s = get_user_settings(user_id)
-            await event.edit(f"TP/SL enabled={new_val}", buttons=_settings_menu(s))
+            await _safe_edit(event, f"TP/SL enabled={new_val}", buttons=_settings_menu(s))
             return
         if data == "set:auto_buy_toggle":
             s = get_user_settings(user_id)
             new_val = 0 if int(s.get("auto_buy_enabled", 1)) else 1
             update_user_settings(user_id, {"auto_buy_enabled": new_val})
             s = get_user_settings(user_id)
-            await event.edit(f"Auto buy enabled={new_val}", buttons=_settings_menu(s))
+            await _safe_edit(event, f"Auto buy enabled={new_val}", buttons=_settings_menu(s))
             return
         if data == "set:dup_toggle":
             s = get_user_settings(user_id)
             new_val = 0 if int(s.get("duplicate_mint_block", 1)) else 1
             update_user_settings(user_id, {"duplicate_mint_block": new_val})
             s = get_user_settings(user_id)
-            await event.edit(f"Duplicate block={new_val}", buttons=_settings_menu(s))
+            await _safe_edit(event, f"Duplicate block={new_val}", buttons=_settings_menu(s))
             return
         if data == "set:take_profit":
             pending[user_id] = {"mode": "setting_value", "field": "take_profit_pct"}
             s = get_user_settings(user_id)
-            await event.edit("Send take profit (%)", buttons=_settings_menu(s))
+            await _safe_edit(event, "Reply with take profit (%).", buttons=_settings_menu(s))
             return
         if data == "set:stop_loss":
             pending[user_id] = {"mode": "setting_value", "field": "stop_loss_pct"}
             s = get_user_settings(user_id)
-            await event.edit("Send stop loss (%)", buttons=_settings_menu(s))
+            await _safe_edit(event, "Reply with stop loss (%).", buttons=_settings_menu(s))
             return
 
         if data == "channels:list":
             rows = list_subscriptions(user_id)
             if not rows:
-                await event.edit("No subscriptions found.", buttons=_channels_menu())
+                await _safe_edit(event, "No subscriptions found.", buttons=_channels_menu())
                 return
             lines = [f"{r['handle']} | {r['status']} | {r['created_at']}" for r in rows]
-            await event.edit("\n".join(lines), buttons=_channels_menu())
+            await _safe_edit(event, "\n".join(lines), buttons=_channels_menu())
             return
         if data == "channels:add":
             pending[user_id] = {"mode": "channels_add"}
-            await event.edit("Send a channel handle to add (e.g., @example).", buttons=_channels_menu())
+            await _safe_edit(event, "Reply with a channel handle to add (e.g., @example).", buttons=_channels_menu())
             return
         if data == "channels:remove":
             pending[user_id] = {"mode": "channels_remove"}
-            await event.edit("Send a channel handle to remove.", buttons=_channels_menu())
+            await _safe_edit(event, "Reply with a channel handle to remove.", buttons=_channels_menu())
             return
 
     await client.run_until_disconnected()
