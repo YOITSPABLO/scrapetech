@@ -4,8 +4,8 @@ from typing import Optional
 
 from telethon import TelegramClient, events, Button
 
-from .db import get_user_settings, list_positions
-from .wallets import wallet_get_pubkey
+from .db import get_user_settings, list_positions, update_user_settings, list_subscriptions, upsert_subscription
+from .wallets import wallet_get_pubkey, wallet_create, wallet_import
 from .auto_trader import auto_buy_for_user, auto_sell_for_position
 
 
@@ -40,7 +40,8 @@ def _main_menu():
     return [
         [Button.inline("Wallet", b"menu:wallet"), Button.inline("Positions", b"menu:positions")],
         [Button.inline("Buy", b"menu:buy"), Button.inline("Sell", b"menu:sell")],
-        [Button.inline("Settings", b"menu:settings"), Button.inline("Help", b"menu:help")],
+        [Button.inline("Settings", b"menu:settings"), Button.inline("Channels", b"menu:channels")],
+        [Button.inline("Help", b"menu:help")],
     ]
 
 
@@ -54,6 +55,48 @@ def _sell_presets(mint: str):
             Button.inline("Sell 50%", f"sell:{mint}:50".encode("utf-8")),
             Button.inline("Sell 100%", f"sell:{mint}:100".encode("utf-8")),
         ],
+        [Button.inline("Back", b"menu:main")],
+    ]
+
+def _wallet_menu():
+    return [
+        [Button.inline("Generate Wallet", b"wallet:generate")],
+        [Button.inline("Import Wallet", b"wallet:import")],
+        [Button.inline("Back", b"menu:main")],
+    ]
+
+def _buy_amount_presets(mint: str):
+    return [
+        [
+            Button.inline("0.001 SOL", f"buyamt:{mint}:0.001".encode("utf-8")),
+            Button.inline("0.005 SOL", f"buyamt:{mint}:0.005".encode("utf-8")),
+        ],
+        [
+            Button.inline("0.01 SOL", f"buyamt:{mint}:0.01".encode("utf-8")),
+            Button.inline("Custom", f"buyamt:{mint}:custom".encode("utf-8")),
+        ],
+        [Button.inline("Back", b"menu:main")],
+    ]
+
+def _confirm_buttons(tag: str):
+    return [
+        [Button.inline("Confirm", f"confirm:{tag}".encode("utf-8"))],
+        [Button.inline("Cancel", b"menu:main")],
+    ]
+
+def _settings_menu():
+    return [
+        [Button.inline("Buy Amount", b"set:buy_amount")],
+        [Button.inline("Buy Slippage", b"set:buy_slippage"), Button.inline("Sell Slippage", b"set:sell_slippage")],
+        [Button.inline("Toggle TP/SL", b"set:tp_sl_toggle")],
+        [Button.inline("Take Profit %", b"set:take_profit"), Button.inline("Stop Loss %", b"set:stop_loss")],
+        [Button.inline("Back", b"menu:main")],
+    ]
+
+def _channels_menu():
+    return [
+        [Button.inline("List Channels", b"channels:list")],
+        [Button.inline("Add Channel", b"channels:add"), Button.inline("Remove Channel", b"channels:remove")],
         [Button.inline("Back", b"menu:main")],
     ]
 
@@ -103,9 +146,23 @@ async def run_bot() -> None:
         user_id = str(event.sender_id)
         pub = wallet_get_pubkey(user_id)
         if not pub:
-            await event.respond("No wallet found. Use the CLI to create/import.")
+            await event.respond("No wallet found.", buttons=_wallet_menu())
             return
-        await event.respond(f"wallet={pub}")
+        await event.respond(f"wallet={pub}", buttons=_wallet_menu())
+
+    @client.on(events.NewMessage(pattern=r"^/import"))
+    async def _import(event):
+        user_id = str(event.sender_id)
+        parts = event.raw_text.split(maxsplit=1)
+        if len(parts) < 2:
+            await event.respond("Usage: /import <secret>")
+            return
+        secret = parts[1].strip()
+        try:
+            rec = wallet_import(user_id, secret)
+            await event.respond(f"WALLET OK: {rec.pubkey}", buttons=_wallet_menu())
+        except Exception as e:
+            await event.respond(f"Import failed: {e}", buttons=_wallet_menu())
 
     @client.on(events.NewMessage(pattern=r"^/positions"))
     async def _positions(event):
@@ -191,6 +248,99 @@ async def run_bot() -> None:
             await event.respond(f"Sell submitted: {sig}")
             return
 
+        if state.get("mode") == "import_wallet":
+            secret = event.raw_text.strip()
+            if not secret:
+                await event.respond("Send the secret key or seed to import.")
+                return
+            pending.pop(user_id, None)
+            try:
+                rec = wallet_import(user_id, secret)
+                await event.respond(f"WALLET OK: {rec.pubkey}", buttons=_wallet_menu())
+            except Exception as e:
+                await event.respond(f"Import failed: {e}", buttons=_wallet_menu())
+            return
+
+        if state.get("mode") == "buy_mint":
+            mint = event.raw_text.strip()
+            if not mint:
+                await event.respond("Send a mint address.")
+                return
+            pending[user_id] = {"mode": "buy_amount", "mint": mint}
+            await event.respond(f"Select buy amount for {mint}:", buttons=_buy_amount_presets(mint))
+            return
+
+        if state.get("mode") == "buy_amount_custom":
+            mint = state.get("mint")
+            try:
+                sol = float(event.raw_text.strip())
+            except Exception:
+                await event.respond("Send a valid SOL amount (e.g., 0.001).")
+                return
+            pending.pop(user_id, None)
+            await event.respond(
+                f"Confirm buy:\nMINT={mint}\nSOL={sol}",
+                buttons=_confirm_buttons(f"buy:{mint}:{sol}"),
+            )
+            return
+
+        if state.get("mode") == "sell_pct_custom":
+            mint = state.get("mint")
+            try:
+                pct = float(event.raw_text.strip())
+            except Exception:
+                await event.respond("Send a valid percent (1-100).")
+                return
+            if pct <= 0 or pct > 100:
+                await event.respond("Percent must be 1-100.")
+                return
+            pending.pop(user_id, None)
+            await event.respond(
+                f"Confirm sell:\nMINT={mint}\nPCT={pct}",
+                buttons=_confirm_buttons(f"sell:{mint}:{pct}"),
+            )
+            return
+
+        if state.get("mode") == "setting_value":
+            field = state.get("field")
+            try:
+                val = float(event.raw_text.strip())
+            except Exception:
+                await event.respond("Send a valid number.")
+                return
+            pending.pop(user_id, None)
+            updates = {field: val}
+            try:
+                update_user_settings(user_id, updates)
+                await event.respond("Settings updated.", buttons=_settings_menu())
+            except Exception as e:
+                await event.respond(f"Update failed: {e}", buttons=_settings_menu())
+            return
+
+        if state.get("mode") == "channels_add":
+            handle = event.raw_text.strip()
+            if not handle:
+                await event.respond("Send a channel handle like @example.")
+                return
+            if not handle.startswith("@"):
+                handle = f"@{handle}"
+            pending.pop(user_id, None)
+            upsert_subscription(user_id, handle, "ACTIVE")
+            await event.respond(f"Added subscription: {handle}", buttons=_channels_menu())
+            return
+
+        if state.get("mode") == "channels_remove":
+            handle = event.raw_text.strip()
+            if not handle:
+                await event.respond("Send a channel handle like @example.")
+                return
+            if not handle.startswith("@"):
+                handle = f"@{handle}"
+            pending.pop(user_id, None)
+            upsert_subscription(user_id, handle, "DELETED")
+            await event.respond(f"Removed subscription: {handle}", buttons=_channels_menu())
+            return
+
     @client.on(events.CallbackQuery)
     async def _callbacks(event):
         user_id = str(event.sender_id)
@@ -201,8 +351,28 @@ async def run_bot() -> None:
             return
         if data == "menu:wallet":
             pub = wallet_get_pubkey(user_id)
-            text = f"wallet={pub}" if pub else "No wallet found. Use the CLI to create/import."
-            await event.edit(text, buttons=_main_menu())
+            text = f"wallet={pub}" if pub else "No wallet found."
+            await event.edit(text, buttons=_wallet_menu())
+            return
+        if data == "wallet:generate":
+            await event.edit("Generating wallet...", buttons=_wallet_menu())
+            try:
+                out = wallet_create(user_id)
+                await event.respond(
+                    "Wallet created.\n"
+                    f"pubkey={out['pubkey']}\n\n"
+                    "Backup options:\n"
+                    f"1) Phantom secret key (base58):\n{out['phantom_secret_base58']}\n\n"
+                    f"2) Phantom secret key (JSON):\n{out['phantom_secret_json']}\n\n"
+                    f"3) Seed (base58):\n{out['seed_base58']}",
+                    buttons=_wallet_menu(),
+                )
+            except Exception as e:
+                await event.respond(f"Generate failed: {e}", buttons=_wallet_menu())
+            return
+        if data == "wallet:import":
+            pending[user_id] = {"mode": "import_wallet"}
+            await event.edit("Send the secret key or seed to import.", buttons=_wallet_menu())
             return
         if data == "menu:positions":
             rows = list_positions(user_id)
@@ -226,8 +396,11 @@ async def run_bot() -> None:
                 f"tp_sl_enabled={s.get('tp_sl_enabled')}\n"
                 f"take_profit_pct={s.get('take_profit_pct')}\n"
                 f"stop_loss_pct={s.get('stop_loss_pct')}",
-                buttons=_main_menu(),
+                buttons=_settings_menu(),
             )
+            return
+        if data == "menu:channels":
+            await event.edit("Channel subscriptions:", buttons=_channels_menu())
             return
         if data == "menu:help":
             await event.edit(
@@ -236,13 +409,14 @@ async def run_bot() -> None:
                 "/sell <mint> <pct>\n"
                 "/positions\n"
                 "/status\n"
-                "/wallet",
+                "/wallet\n"
+                "/import <secret>",
                 buttons=_main_menu(),
             )
             return
         if data == "menu:buy":
-            pending[user_id] = {"mode": "buy"}
-            await event.edit("Send: /buy <mint> [sol]", buttons=_main_menu())
+            pending[user_id] = {"mode": "buy_mint"}
+            await event.edit("Send a mint address to buy.", buttons=_main_menu())
             return
         if data == "menu:sell":
             rows = list_positions(user_id)
@@ -259,6 +433,19 @@ async def run_bot() -> None:
             await event.edit("Select a mint:", buttons=buttons)
             return
 
+        if data.startswith("buyamt:"):
+            _tag, mint, amount = data.split(":")
+            if amount == "custom":
+                pending[user_id] = {"mode": "buy_amount_custom", "mint": mint}
+                await event.edit("Send custom SOL amount.", buttons=_main_menu())
+                return
+            sol = float(amount)
+            await event.edit(
+                f"Confirm buy:\nMINT={mint}\nSOL={sol}",
+                buttons=_confirm_buttons(f"buy:{mint}:{sol}"),
+            )
+            return
+
         if data.startswith("sellpick:"):
             mint = data.split(":", 1)[1]
             await event.edit(f"Sell presets for {mint}:", buttons=_sell_presets(mint))
@@ -272,9 +459,76 @@ async def run_bot() -> None:
                 await event.edit("No position balance found.", buttons=_main_menu())
                 return
             tokens = float(row["token_balance"]) * (pct / 100.0)
-            await event.edit("Submitting sell...", buttons=_main_menu())
-            sig = await asyncio.to_thread(auto_sell_for_position, user_id, mint, tokens)
-            await event.respond(f"Sell submitted: {sig}")
+            await event.edit(
+                f"Confirm sell:\nMINT={mint}\nPCT={pct}",
+                buttons=_confirm_buttons(f"sell:{mint}:{pct}"),
+            )
+            pending[user_id] = {"mode": "sell_confirm", "mint": mint, "pct": pct}
+            return
+
+        if data.startswith("confirm:"):
+            _tag, action, mint, amt = data.split(":")
+            if action == "buy":
+                sol = float(amt)
+                await event.edit("Submitting buy...", buttons=_main_menu())
+                sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
+                await event.respond(f"Buy submitted: {sig}")
+                return
+            if action == "sell":
+                pct = float(amt)
+                pos = list_positions(user_id)
+                row = next((r for r in pos if r["mint"] == mint), None)
+                if not row or float(row["token_balance"]) <= 0:
+                    await event.edit("No position balance found.", buttons=_main_menu())
+                    return
+                tokens = float(row["token_balance"]) * (pct / 100.0)
+                await event.edit("Submitting sell...", buttons=_main_menu())
+                sig = await asyncio.to_thread(auto_sell_for_position, user_id, mint, tokens)
+                await event.respond(f"Sell submitted: {sig}")
+                return
+
+        if data == "set:buy_amount":
+            pending[user_id] = {"mode": "setting_value", "field": "buy_amount_sol"}
+            await event.edit("Send new buy amount (SOL).", buttons=_settings_menu())
+            return
+        if data == "set:buy_slippage":
+            pending[user_id] = {"mode": "setting_value", "field": "buy_slippage_pct"}
+            await event.edit("Send new buy slippage (%)", buttons=_settings_menu())
+            return
+        if data == "set:sell_slippage":
+            pending[user_id] = {"mode": "setting_value", "field": "sell_slippage_pct"}
+            await event.edit("Send new sell slippage (%)", buttons=_settings_menu())
+            return
+        if data == "set:tp_sl_toggle":
+            s = get_user_settings(user_id)
+            new_val = 0 if int(s.get("tp_sl_enabled", 1)) else 1
+            update_user_settings(user_id, {"tp_sl_enabled": new_val})
+            await event.edit(f"TP/SL enabled={new_val}", buttons=_settings_menu())
+            return
+        if data == "set:take_profit":
+            pending[user_id] = {"mode": "setting_value", "field": "take_profit_pct"}
+            await event.edit("Send take profit (%)", buttons=_settings_menu())
+            return
+        if data == "set:stop_loss":
+            pending[user_id] = {"mode": "setting_value", "field": "stop_loss_pct"}
+            await event.edit("Send stop loss (%)", buttons=_settings_menu())
+            return
+
+        if data == "channels:list":
+            rows = list_subscriptions(user_id)
+            if not rows:
+                await event.edit("No subscriptions found.", buttons=_channels_menu())
+                return
+            lines = [f"{r['handle']} | {r['status']} | {r['created_at']}" for r in rows]
+            await event.edit("\n".join(lines), buttons=_channels_menu())
+            return
+        if data == "channels:add":
+            pending[user_id] = {"mode": "channels_add"}
+            await event.edit("Send a channel handle to add (e.g., @example).", buttons=_channels_menu())
+            return
+        if data == "channels:remove":
+            pending[user_id] = {"mode": "channels_remove"}
+            await event.edit("Send a channel handle to remove.", buttons=_channels_menu())
             return
 
     await client.run_until_disconnected()
