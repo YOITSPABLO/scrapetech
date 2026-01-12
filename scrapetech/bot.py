@@ -84,13 +84,32 @@ def _confirm_buttons(tag: str):
         [Button.inline("Cancel", b"menu:main")],
     ]
 
-def _settings_menu():
+def _settings_menu(s):
+    buy_amt = s.get("buy_amount_sol")
+    buy_slip = s.get("buy_slippage_pct")
+    sell_slip = s.get("sell_slippage_pct")
+    tp_on = int(s.get("tp_sl_enabled", 1))
+    tp = s.get("take_profit_pct")
+    sl = s.get("stop_loss_pct")
+    auto_buy = int(s.get("auto_buy_enabled", 1))
+    dup_block = int(s.get("duplicate_mint_block", 1))
+
+    tp_label = "TP/SL ✅" if tp_on else "TP/SL ❌"
+    auto_label = "Auto Buy ✅" if auto_buy else "Auto Buy ❌"
+    dup_label = "Duplicate Buy ⛔" if dup_block else "Duplicate Buy ✅"
+
     return [
-        [Button.inline("Buy Amount", b"set:buy_amount")],
-        [Button.inline("Buy Slippage", b"set:buy_slippage"), Button.inline("Sell Slippage", b"set:sell_slippage")],
-        [Button.inline("Toggle TP/SL", b"set:tp_sl_toggle")],
-        [Button.inline("Take Profit %", b"set:take_profit"), Button.inline("Stop Loss %", b"set:stop_loss")],
-        [Button.inline("Allow Auto Buy", b"set:auto_buy_toggle"), Button.inline("Duplicate Buy", b"set:dup_toggle")],
+        [Button.inline(f"Buy Amount | {buy_amt} SOL", b"set:buy_amount")],
+        [
+            Button.inline(f"Buy Slippage | {buy_slip}%", b"set:buy_slippage"),
+            Button.inline(f"Sell Slippage | {sell_slip}%", b"set:sell_slippage"),
+        ],
+        [Button.inline(tp_label, b"set:tp_sl_toggle")],
+        [
+            Button.inline(f"Take Profit | {tp}%", b"set:take_profit"),
+            Button.inline(f"Stop Loss | {sl}%", b"set:stop_loss"),
+        ],
+        [Button.inline(auto_label, b"set:auto_buy_toggle"), Button.inline(dup_label, b"set:dup_toggle")],
         [Button.inline("Scraper Settings", b"menu:channels")],
         [Button.inline("Back", b"menu:main")],
     ]
@@ -314,9 +333,11 @@ async def run_bot() -> None:
             updates = {field: val}
             try:
                 update_user_settings(user_id, updates)
-                await event.respond("Settings updated.", buttons=_settings_menu())
+                s = get_user_settings(user_id)
+                await event.respond("Settings updated.", buttons=_settings_menu(s))
             except Exception as e:
-                await event.respond(f"Update failed: {e}", buttons=_settings_menu())
+                s = get_user_settings(user_id)
+                await event.respond(f"Update failed: {e}", buttons=_settings_menu(s))
             return
 
         if state.get("mode") == "channels_add":
@@ -392,15 +413,8 @@ async def run_bot() -> None:
         if data == "menu:settings":
             s = get_user_settings(user_id)
             await event.edit(
-                f"buy_amount_sol={s.get('buy_amount_sol')}\n"
-                f"buy_slippage_pct={s.get('buy_slippage_pct')}\n"
-                f"sell_slippage_pct={s.get('sell_slippage_pct')}\n"
-                f"tp_sl_enabled={s.get('tp_sl_enabled')}\n"
-                f"take_profit_pct={s.get('take_profit_pct')}\n"
-                f"stop_loss_pct={s.get('stop_loss_pct')}\n"
-                f"auto_buy_enabled={s.get('auto_buy_enabled', 1)}\n"
-                f"duplicate_mint_block={s.get('duplicate_mint_block')}",
-                buttons=_settings_menu(),
+                "Settings (tap a row, then reply with a value when prompted):",
+                buttons=_settings_menu(s),
             )
             return
         if data == "menu:channels":
@@ -493,41 +507,49 @@ async def run_bot() -> None:
 
         if data == "set:buy_amount":
             pending[user_id] = {"mode": "setting_value", "field": "buy_amount_sol"}
-            await event.edit("Send new buy amount (SOL).", buttons=_settings_menu())
+            s = get_user_settings(user_id)
+            await event.edit("Send new buy amount (SOL).", buttons=_settings_menu(s))
             return
         if data == "set:buy_slippage":
             pending[user_id] = {"mode": "setting_value", "field": "buy_slippage_pct"}
-            await event.edit("Send new buy slippage (%)", buttons=_settings_menu())
+            s = get_user_settings(user_id)
+            await event.edit("Send new buy slippage (%)", buttons=_settings_menu(s))
             return
         if data == "set:sell_slippage":
             pending[user_id] = {"mode": "setting_value", "field": "sell_slippage_pct"}
-            await event.edit("Send new sell slippage (%)", buttons=_settings_menu())
+            s = get_user_settings(user_id)
+            await event.edit("Send new sell slippage (%)", buttons=_settings_menu(s))
             return
         if data == "set:tp_sl_toggle":
             s = get_user_settings(user_id)
             new_val = 0 if int(s.get("tp_sl_enabled", 1)) else 1
             update_user_settings(user_id, {"tp_sl_enabled": new_val})
-            await event.edit(f"TP/SL enabled={new_val}", buttons=_settings_menu())
+            s = get_user_settings(user_id)
+            await event.edit(f"TP/SL enabled={new_val}", buttons=_settings_menu(s))
             return
         if data == "set:auto_buy_toggle":
             s = get_user_settings(user_id)
             new_val = 0 if int(s.get("auto_buy_enabled", 1)) else 1
             update_user_settings(user_id, {"auto_buy_enabled": new_val})
-            await event.edit(f"Auto buy enabled={new_val}", buttons=_settings_menu())
+            s = get_user_settings(user_id)
+            await event.edit(f"Auto buy enabled={new_val}", buttons=_settings_menu(s))
             return
         if data == "set:dup_toggle":
             s = get_user_settings(user_id)
             new_val = 0 if int(s.get("duplicate_mint_block", 1)) else 1
             update_user_settings(user_id, {"duplicate_mint_block": new_val})
-            await event.edit(f"Duplicate block={new_val}", buttons=_settings_menu())
+            s = get_user_settings(user_id)
+            await event.edit(f"Duplicate block={new_val}", buttons=_settings_menu(s))
             return
         if data == "set:take_profit":
             pending[user_id] = {"mode": "setting_value", "field": "take_profit_pct"}
-            await event.edit("Send take profit (%)", buttons=_settings_menu())
+            s = get_user_settings(user_id)
+            await event.edit("Send take profit (%)", buttons=_settings_menu(s))
             return
         if data == "set:stop_loss":
             pending[user_id] = {"mode": "setting_value", "field": "stop_loss_pct"}
-            await event.edit("Send stop loss (%)", buttons=_settings_menu())
+            s = get_user_settings(user_id)
+            await event.edit("Send stop loss (%)", buttons=_settings_menu(s))
             return
 
         if data == "channels:list":
