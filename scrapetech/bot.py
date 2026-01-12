@@ -420,6 +420,7 @@ async def run_bot() -> None:
         if data == "menu:settings":
             s = get_user_settings(user_id)
             await _safe_edit(
+                event,
                 "Settings (tap a row, then reply with a value when prompted):",
                 buttons=_settings_menu(s),
             )
@@ -429,6 +430,7 @@ async def run_bot() -> None:
             return
         if data == "menu:help":
             await _safe_edit(
+                event,
                 "Commands:\n"
                 "/buy <mint> [sol]\n"
                 "/sell <mint> <pct>\n"
