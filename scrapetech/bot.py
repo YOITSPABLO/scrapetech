@@ -8,6 +8,9 @@ from telethon.errors import MessageNotModifiedError
 from .db import get_user_settings, list_positions, update_user_settings, list_subscriptions, upsert_subscription
 from .wallets import wallet_get_pubkey, wallet_create, wallet_import
 from .auto_trader import auto_buy_for_user, auto_sell_for_position
+from .detector import detect_mints
+from .pump_quotes import quote_buy_pumpfun
+from .solana_rpc import fetch_mint_info
 
 
 def _get_bot_token() -> str:
@@ -243,8 +246,17 @@ async def run_bot() -> None:
     @client.on(events.NewMessage)
     async def _text_router(event):
         user_id = str(event.sender_id)
+        text = (event.raw_text or "").strip()
+        if text.startswith("/"):
+            return
         state = pending.get(user_id)
         if not state:
+            # detect mints in free text and show quick trade menu
+            mints = detect_mints(text)
+            if not mints:
+                return
+            mint = mints[0].mint
+            await _send_mint_card(event, user_id, mint)
             return
         prompt_id = state.get("prompt_id")
         if prompt_id and event.message.reply_to_msg_id != prompt_id:
@@ -373,6 +385,43 @@ async def run_bot() -> None:
             upsert_subscription(user_id, handle, "DELETED")
             await event.respond(f"Removed subscription: {handle}", buttons=_channels_menu())
             return
+
+    async def _send_mint_card(event, user_id: str, mint: str):
+        s = get_user_settings(user_id)
+        sol_in = float(s.get("buy_amount_sol") or 0.0)
+        info_lines = [f"MINT: {mint}"]
+
+        try:
+            q = quote_buy_pumpfun(mint, sol_in=sol_in, fee_bps=0)
+            info_lines.append(f"EST TOKENS (for {sol_in} SOL): {q.est_tokens_out_ui:.6f}" if q.est_tokens_out_ui else "")
+            if q.est_price_sol_per_token:
+                info_lines.append(f"PRICE: {q.est_price_sol_per_token:.12f} SOL")
+        except Exception:
+            pass
+
+        try:
+            mi = fetch_mint_info(mint)
+            if mi and mi.decimals is not None and mi.supply is not None:
+                supply_ui = mi.supply / (10 ** int(mi.decimals))
+                if "PRICE:" in "\n".join(info_lines):
+                    price_line = next((l for l in info_lines if l.startswith("PRICE:")), None)
+                    if price_line:
+                        price = float(price_line.split(" ")[1])
+                        mcap = price * supply_ui
+                        info_lines.append(f"MCAP (est): {mcap:,.2f} SOL")
+        except Exception:
+            pass
+
+        rows = list_positions(user_id)
+        has_pos = any(r["mint"] == mint and float(r["token_balance"]) > 0 for r in rows)
+        buttons = _buy_amount_presets(mint)
+        if has_pos:
+            buttons = [
+                [Button.inline("Sell Presets", f"sellpick:{mint}".encode("utf-8"))],
+                *buttons,
+            ]
+        buttons.append([Button.inline("Main Menu", b"menu:main")])
+        await event.respond("\n".join([l for l in info_lines if l]), buttons=buttons)
 
     @client.on(events.CallbackQuery)
     async def _callbacks(event):
