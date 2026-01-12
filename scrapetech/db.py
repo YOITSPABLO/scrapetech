@@ -82,7 +82,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             trade_mode TEXT NOT NULL DEFAULT 'normal',
             position_mode TEXT NOT NULL DEFAULT 'single',
             max_open_positions INTEGER NOT NULL DEFAULT 1,
-            buy_amount_sol REAL NOT NULL DEFAULT 0.5,
+            buy_amount_sol REAL NOT NULL DEFAULT 0.001,
             buy_slippage_pct REAL NOT NULL DEFAULT 20.0,
             sell_slippage_pct REAL NOT NULL DEFAULT 20.0,
             tp_sl_enabled INTEGER NOT NULL DEFAULT 1,
@@ -121,6 +121,71 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             mint TEXT NOT NULL,
             first_auto_buy_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, mint),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE,
+            pubkey TEXT NOT NULL,
+            enc_secret BLOB NOT NULL,
+            salt BLOB NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            mint TEXT NOT NULL,
+            token_balance REAL NOT NULL DEFAULT 0,
+            avg_entry_sol REAL NOT NULL DEFAULT 0,
+            total_sol_spent REAL NOT NULL DEFAULT 0,
+            total_sol_received REAL NOT NULL DEFAULT 0,
+            realized_pnl_sol REAL NOT NULL DEFAULT 0,
+            open INTEGER NOT NULL DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, mint),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            mint TEXT NOT NULL,
+            side TEXT NOT NULL,
+            token_amount REAL NOT NULL,
+            sol_amount REAL NOT NULL,
+            price_sol_per_token REAL NOT NULL,
+            tx_sig TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS pending_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            mint TEXT NOT NULL,
+            side TEXT NOT NULL,
+            signature TEXT NOT NULL UNIQUE,
+            requested_token_amount REAL,
+            requested_sol_amount REAL,
+            actual_token_amount REAL,
+            actual_sol_amount REAL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            error TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
         """)
@@ -165,6 +230,12 @@ def get_or_create_user(telegram_user_id: str, db_path: str = DEFAULT_DB_PATH) ->
         conn.execute("INSERT OR IGNORE INTO users (telegram_user_id) VALUES (?)", (telegram_user_id,))
         row = conn.execute("SELECT id FROM users WHERE telegram_user_id=?", (telegram_user_id,)).fetchone()
         return int(row["id"])
+
+def get_telegram_user_id(user_id: int, db_path: str = DEFAULT_DB_PATH) -> str | None:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT telegram_user_id FROM users WHERE id=?", (int(user_id),)).fetchone()
+        return str(row["telegram_user_id"]) if row else None
 
 def insert_message(channel_id: int, telegram_message_id: int, text: str, db_path: str = DEFAULT_DB_PATH) -> int:
     init_db(db_path)
@@ -307,4 +378,213 @@ def tail_trade_intents(n: int = 20, db_path: str = DEFAULT_DB_PATH):
             """,
             (n,),
         ).fetchall()
+        return [dict(r) for r in rows]
+
+def get_position(telegram_user_id: str, mint: str, db_path: str = DEFAULT_DB_PATH):
+    user_id = get_or_create_user(telegram_user_id, db_path=db_path)
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM positions
+            WHERE user_id=? AND mint=?
+            """,
+            (user_id, mint),
+        ).fetchone()
+        return dict(row) if row else None
+
+def list_positions(telegram_user_id: str, db_path: str = DEFAULT_DB_PATH):
+    user_id = get_or_create_user(telegram_user_id, db_path=db_path)
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM positions
+            WHERE user_id=?
+            ORDER BY mint
+            """,
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def apply_trade(
+    telegram_user_id: str,
+    mint: str,
+    side: str,
+    token_amount: float,
+    sol_amount: float,
+    tx_sig: str | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+):
+    epsilon = 1e-9
+    if token_amount <= 0 or sol_amount <= 0:
+        raise ValueError("token_amount and sol_amount must be positive")
+
+    side = side.strip().upper()
+    if side not in ("BUY", "SELL"):
+        raise ValueError("side must be BUY or SELL")
+
+    user_id = get_or_create_user(telegram_user_id, db_path=db_path)
+    init_db(db_path)
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM positions
+            WHERE user_id=? AND mint=?
+            """,
+            (user_id, mint),
+        ).fetchone()
+
+        token_balance = float(row["token_balance"]) if row else 0.0
+        avg_entry = float(row["avg_entry_sol"]) if row else 0.0
+        total_spent = float(row["total_sol_spent"]) if row else 0.0
+        total_received = float(row["total_sol_received"]) if row else 0.0
+        realized_pnl = float(row["realized_pnl_sol"]) if row else 0.0
+
+        if side == "BUY":
+            new_balance = token_balance + token_amount
+            new_total_spent = total_spent + sol_amount
+            new_avg_entry = new_total_spent / new_balance if new_balance > 0 else 0.0
+            new_total_received = total_received
+            new_realized_pnl = realized_pnl
+            open_flag = 1
+        else:
+            if token_balance <= 0:
+                raise ValueError("No open position to sell")
+            if token_amount > token_balance:
+                raise ValueError("Cannot sell more than current token balance")
+
+            pnl = sol_amount - (token_amount * avg_entry)
+            new_balance = token_balance - token_amount
+            new_total_spent = total_spent
+            new_total_received = total_received + sol_amount
+            new_realized_pnl = realized_pnl + pnl
+            if new_balance <= epsilon:
+                new_balance = 0.0
+                new_avg_entry = 0.0
+                open_flag = 0
+            else:
+                new_avg_entry = avg_entry
+                open_flag = 1
+
+        price = sol_amount / token_amount
+        conn.execute(
+            """
+            INSERT INTO trades (user_id, mint, side, token_amount, sol_amount, price_sol_per_token, tx_sig)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, mint, side, token_amount, sol_amount, price, tx_sig),
+        )
+
+        if row:
+            conn.execute(
+                """
+                UPDATE positions
+                SET token_balance=?, avg_entry_sol=?, total_sol_spent=?, total_sol_received=?,
+                    realized_pnl_sol=?, open=?, updated_at=CURRENT_TIMESTAMP
+                WHERE user_id=? AND mint=?
+                """,
+                (
+                    new_balance, new_avg_entry, new_total_spent, new_total_received,
+                    new_realized_pnl, open_flag, user_id, mint,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO positions (user_id, mint, token_balance, avg_entry_sol, total_sol_spent,
+                                       total_sol_received, realized_pnl_sol, open)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id, mint, new_balance, new_avg_entry, new_total_spent,
+                    new_total_received, new_realized_pnl, open_flag,
+                ),
+            )
+
+        row = conn.execute(
+            "SELECT * FROM positions WHERE user_id=? AND mint=?",
+            (user_id, mint),
+        ).fetchone()
+        return dict(row) if row else None
+
+def enqueue_pending_trade(
+    telegram_user_id: str,
+    mint: str,
+    side: str,
+    signature: str,
+    requested_token_amount: float | None = None,
+    requested_sol_amount: float | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    side = side.strip().upper()
+    if side not in ("BUY", "SELL"):
+        raise ValueError("side must be BUY or SELL")
+
+    user_id = get_or_create_user(telegram_user_id, db_path=db_path)
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO pending_trades (
+                user_id, mint, side, signature, requested_token_amount, requested_sol_amount, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
+            ON CONFLICT(signature) DO UPDATE SET
+                requested_token_amount=excluded.requested_token_amount,
+                requested_sol_amount=excluded.requested_sol_amount,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, mint, side, signature, requested_token_amount, requested_sol_amount),
+        )
+
+def update_pending_trade_status(
+    signature: str,
+    status: str,
+    error: str | None = None,
+    actual_token_amount: float | None = None,
+    actual_sol_amount: float | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    status = status.strip().upper()
+    if status not in ("PENDING", "SUCCESS", "FAILED"):
+        raise ValueError("status must be PENDING, SUCCESS, or FAILED")
+
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE pending_trades
+            SET status=?, error=?, actual_token_amount=?, actual_sol_amount=?, updated_at=CURRENT_TIMESTAMP
+            WHERE signature=?
+            """,
+            (status, error, actual_token_amount, actual_sol_amount, signature),
+        )
+
+def list_pending_trades(status: str | None = "PENDING", limit: int = 50, db_path: str = DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect(db_path) as conn:
+        if status:
+            rows = conn.execute(
+                """
+                SELECT * FROM pending_trades
+                WHERE status=?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (status, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM pending_trades
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
         return [dict(r) for r in rows]

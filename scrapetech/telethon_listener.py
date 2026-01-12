@@ -1,8 +1,10 @@
+import asyncio
 import logging
 from telethon import TelegramClient, events
 from .config import Settings
 from .detector import detect_mints
 from .db import get_or_create_channel, insert_message, insert_signal, active_subscribers_for_channel
+from .auto_trader import auto_buy_for_user
 
 log = logging.getLogger("scrapetech")
 
@@ -45,6 +47,16 @@ async def run_listen(channel: str) -> None:
                 log.info("ROUTE mint=%s -> users=%s", dm.mint, users)
             else:
                 log.info("ROUTE mint=%s -> users=[] (no active subscribers)", dm.mint)
+
+            def _auto_buy_sync(user_id: str, mint: str):
+                try:
+                    auto_buy_for_user(user_id, mint)
+                    log.info("AUTO_BUY queued: user=%s mint=%s", user_id, mint)
+                except Exception as e:
+                    log.error("AUTO_BUY failed: user=%s mint=%s err=%s", user_id, mint, e)
+
+            for u in users:
+                asyncio.create_task(asyncio.to_thread(_auto_buy_sync, u, dm.mint))
 
     log.info("Listening on %s", channel)
     await client.run_until_disconnected()

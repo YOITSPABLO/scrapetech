@@ -11,6 +11,8 @@ from .db import (
     upsert_subscription, list_subscriptions,
     update_user_settings, get_user_settings,
     tail_trade_intents,
+    apply_trade, get_position, list_positions,
+    enqueue_pending_trade, update_pending_trade_status, list_pending_trades, get_telegram_user_id,
 )
 
 from .wallets import wallet_create, wallet_import, wallet_get_pubkey
@@ -25,6 +27,12 @@ from .pump_tx import (
     send_buy_tx,
     dump_ix_accounts,
 )
+import time
+
+from .pump_sell import build_sell_ix_and_plan, build_and_simulate_sell_tx, send_sell_tx
+from .solana_rpc import try_get_mint_decimals, rpc_get_transaction, extract_tx_deltas, get_http_client
+from .auto_trader import monitor_positions_loop
+from .bot import run_bot
 
 
 def main():
@@ -81,6 +89,34 @@ def main():
     int_tail = int_sub.add_parser("tail")
     int_tail.add_argument("-n", type=int, default=20)
 
+    # reconcile
+    p_rec = sub.add_parser("reconcile", help="Reconcile pending trades")
+    p_rec.add_argument("--limit", type=int, default=20)
+    p_rec.add_argument("--status", default="PENDING")
+    p_rec.add_argument("--watch", action="store_true", help="Loop and reconcile periodically")
+    p_rec.add_argument("--interval", type=int, default=10, help="Seconds between reconcile runs")
+
+    # monitor
+    p_mon = sub.add_parser("monitor", help="Monitor positions for TP/SL and auto-sell")
+    p_mon.add_argument("--interval", type=int, default=10)
+
+    # bot
+    sub.add_parser("bot", help="Run Telegram bot commands (user-facing)")
+
+    # positions
+    p_pos = sub.add_parser("pos", help="Position utilities (CLI testing)")
+    pos_sub = p_pos.add_subparsers(dest="poscmd", required=True)
+    pos_show = pos_sub.add_parser("show")
+    pos_show.add_argument("--user", required=True)
+    pos_show.add_argument("--mint")
+    pos_apply = pos_sub.add_parser("apply")
+    pos_apply.add_argument("--user", required=True)
+    pos_apply.add_argument("--mint", required=True)
+    pos_apply.add_argument("--side", required=True, choices=["BUY", "SELL"])
+    pos_apply.add_argument("--tokens", required=True, type=float)
+    pos_apply.add_argument("--sol", required=True, type=float)
+    pos_apply.add_argument("--tx", default=None)
+
     # wallets
     p_w = sub.add_parser("wallet", help="Wallet utilities (CLI testing)")
     w_sub = p_w.add_subparsers(dest="wcmd", required=True)
@@ -131,6 +167,31 @@ def main():
     e_dump_buytx.add_argument("--mint", required=True)
     e_dump_buytx.add_argument("--sol", type=float, default=None)
     e_dump_buytx.add_argument("--slippage", type=float, default=None)
+
+    # sell (pumpfun)
+    e_build_sell = e_sub.add_parser("build-sell", help="Build Pump.fun sell instruction (no tx)")
+    e_build_sell.add_argument("--user", required=True)
+    e_build_sell.add_argument("--mint", required=True)
+    e_build_sell.add_argument("--pct", type=float, default=None)
+    e_build_sell.add_argument("--tokens", type=float, default=None)
+    e_build_sell.add_argument("--min-sol", type=float, default=None)
+    e_build_sell.add_argument("--min-sol-lamports", type=int, default=None)
+
+    e_sim_selltx = e_sub.add_parser("simulate-selltx", help="Simulate Pump.fun sell tx (no send)")
+    e_sim_selltx.add_argument("--user", required=True)
+    e_sim_selltx.add_argument("--mint", required=True)
+    e_sim_selltx.add_argument("--pct", type=float, default=None)
+    e_sim_selltx.add_argument("--tokens", type=float, default=None)
+    e_sim_selltx.add_argument("--min-sol", type=float, default=None)
+    e_sim_selltx.add_argument("--min-sol-lamports", type=int, default=None)
+
+    e_send_sell = e_sub.add_parser("send-sell", help="SEND Pump.fun sell tx (REAL TX)")
+    e_send_sell.add_argument("--user", required=True)
+    e_send_sell.add_argument("--mint", required=True)
+    e_send_sell.add_argument("--pct", type=float, default=None)
+    e_send_sell.add_argument("--tokens", type=float, default=None)
+    e_send_sell.add_argument("--min-sol", type=float, default=None)
+    e_send_sell.add_argument("--min-sol-lamports", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -257,6 +318,124 @@ def main():
                 )
             return
 
+    if args.command == "reconcile":
+        status = args.status.strip().upper() if args.status else None
+        if status in ("ALL", "*"):
+            status = None
+
+        def _run_once():
+            rows = list_pending_trades(status=status, limit=args.limit)
+            if not rows:
+                print("No pending trades.")
+                return
+
+            http = get_http_client()
+            for r in rows:
+                sig = r["signature"]
+                tx = rpc_get_transaction(http, sig)
+                if not tx or not tx.get("meta"):
+                    continue
+
+                meta = tx.get("meta") or {}
+                if meta.get("err"):
+                    update_pending_trade_status(sig, "FAILED", error=str(meta.get("err")))
+                    print(f"FAILED {sig} err={meta.get('err')}")
+                    continue
+
+                telegram_user_id = get_telegram_user_id(r["user_id"])
+                if not telegram_user_id:
+                    update_pending_trade_status(sig, "FAILED", error="user not found")
+                    print(f"FAILED {sig} err=user not found")
+                    continue
+
+                owner_pubkey = wallet_get_pubkey(telegram_user_id)
+                if not owner_pubkey:
+                    update_pending_trade_status(sig, "FAILED", error="wallet not found")
+                    print(f"FAILED {sig} err=wallet not found")
+                    continue
+
+                deltas = extract_tx_deltas(tx, owner_pubkey=owner_pubkey, mint=r["mint"])
+                sol_delta = deltas.get("sol_delta_lamports")
+                token_delta_ui = deltas.get("token_delta_ui")
+                if sol_delta is None or token_delta_ui is None:
+                    continue
+
+                actual_sol = abs(sol_delta) / 1_000_000_000
+                actual_tokens = abs(token_delta_ui)
+                apply_trade(
+                    telegram_user_id,
+                    r["mint"],
+                    r["side"],
+                    actual_tokens,
+                    actual_sol,
+                    tx_sig=sig,
+                )
+                update_pending_trade_status(
+                    sig,
+                    "SUCCESS",
+                    actual_token_amount=actual_tokens,
+                    actual_sol_amount=actual_sol,
+                )
+                print(f"OK {sig} tokens={actual_tokens} sol={actual_sol}")
+
+        if not args.watch:
+            _run_once()
+            return
+
+        while True:
+            _run_once()
+            time.sleep(max(1, int(args.interval)))
+
+    if args.command == "monitor":
+        print(f"Monitor started (interval={args.interval}s)")
+        monitor_positions_loop(interval=args.interval)
+
+    if args.command == "bot":
+        asyncio.run(run_bot())
+
+    if args.command == "pos":
+        if args.poscmd == "show":
+            if args.mint:
+                row = get_position(args.user, args.mint)
+                if not row:
+                    print("No position found.")
+                    return
+                print(
+                    f"{row['mint']} | tokens={row['token_balance']} | avg_entry={row['avg_entry_sol']} | "
+                    f"spent={row['total_sol_spent']} | received={row['total_sol_received']} | "
+                    f"realized_pnl={row['realized_pnl_sol']} | open={row['open']}"
+                )
+                return
+            rows = list_positions(args.user)
+            if not rows:
+                print("No positions found.")
+                return
+            for row in rows:
+                print(
+                    f"{row['mint']} | tokens={row['token_balance']} | avg_entry={row['avg_entry_sol']} | "
+                    f"spent={row['total_sol_spent']} | received={row['total_sol_received']} | "
+                    f"realized_pnl={row['realized_pnl_sol']} | open={row['open']}"
+                )
+            return
+        if args.poscmd == "apply":
+            row = apply_trade(
+                args.user,
+                args.mint,
+                args.side,
+                args.tokens,
+                args.sol,
+                tx_sig=args.tx,
+            )
+            if not row:
+                print("No position found.")
+                return
+            print(
+                f"{row['mint']} | tokens={row['token_balance']} | avg_entry={row['avg_entry_sol']} | "
+                f"spent={row['total_sol_spent']} | received={row['total_sol_received']} | "
+                f"realized_pnl={row['realized_pnl_sol']} | open={row['open']}"
+            )
+            return
+
     if args.command == "wallet":
         if args.wcmd == "create":
             out = wallet_create(args.user)
@@ -288,6 +467,32 @@ def main():
             return
 
     if args.command == "exec":
+        def _resolve_sell_amount(user: str, mint: str, pct: float | None, tokens_ui: float | None):
+            if tokens_ui is None:
+                pct_val = 100.0 if pct is None else float(pct)
+                if pct_val <= 0 or pct_val > 100:
+                    raise ValueError("pct must be in (0,100]")
+                pos = get_position(user, mint)
+                if not pos or float(pos.get("token_balance") or 0) <= 0:
+                    raise ValueError("No position balance found for this user+mint")
+                tokens_ui = float(pos["token_balance"]) * (pct_val / 100.0)
+
+            decimals = try_get_mint_decimals(mint)
+            if decimals is None:
+                raise ValueError("Could not determine mint decimals for sell sizing")
+
+            tokens_raw = int(tokens_ui * (10 ** int(decimals)))
+            if tokens_raw <= 0:
+                raise ValueError("tokens_to_sell_raw computed as 0; adjust pct/tokens")
+            return tokens_ui, tokens_raw, int(decimals)
+
+        def _resolve_min_sol(min_sol: float | None, min_sol_lamports: int | None) -> int:
+            if min_sol_lamports is not None:
+                return int(min_sol_lamports)
+            if min_sol is not None:
+                return int(float(min_sol) * 1_000_000_000)
+            return 1
+
         # quote-buy
         if args.ecmd == "quote-buy":
             from .db import get_or_create_user
@@ -335,7 +540,7 @@ def main():
             print(f"MINT: {plan.mint}")
             print(f"TOKEN PROGRAM: {plan.token_program}")
             print(f"BONDING CURVE: {plan.bonding_curve}")
-            print(f"ASSOCIATED USER: {user_ata}")
+            print(f"ASSOCIATED USER: {plan.user_ata}")
             print(f"TOKENS OUT (raw): {plan.tokens_out_raw}")
             print(f"MAX SOL COST (lamports): {plan.max_sol_cost_lamports} (slippage={plan.slippage_pct}%)")
             print("NO TRANSACTION SENT.")
@@ -387,6 +592,58 @@ def main():
             plan = out["plan"]
             sig = out["sig"]
 
+            req_tokens_ui = None
+            decimals = try_get_mint_decimals(plan.mint)
+            if decimals is not None:
+                req_tokens_ui = plan.tokens_out_raw / (10 ** int(decimals))
+
+            enqueue_pending_trade(
+                args.user,
+                plan.mint,
+                "BUY",
+                sig,
+                requested_token_amount=req_tokens_ui,
+                requested_sol_amount=sol_in,
+            )
+
+            sol_amount = None
+            token_amount_ui = None
+            http = get_http_client()
+            for _ in range(6):
+                try:
+                    tx = rpc_get_transaction(http, sig)
+                    deltas = extract_tx_deltas(tx, plan.user_pubkey, plan.mint)
+                    sol_delta = deltas.get("sol_delta_lamports")
+                    token_delta_ui = deltas.get("token_delta_ui")
+                    if sol_delta is not None:
+                        sol_amount = abs(sol_delta) / 1_000_000_000
+                    if token_delta_ui is not None:
+                        token_amount_ui = abs(token_delta_ui)
+                    if sol_amount is not None and token_amount_ui is not None:
+                        break
+                except Exception:
+                    pass
+                time.sleep(2)
+
+            if sol_amount is not None and token_amount_ui is not None:
+                try:
+                    apply_trade(
+                        args.user,
+                        plan.mint,
+                        "BUY",
+                        float(token_amount_ui),
+                        float(sol_amount),
+                        tx_sig=sig,
+                    )
+                    update_pending_trade_status(
+                        sig,
+                        "SUCCESS",
+                        actual_token_amount=float(token_amount_ui),
+                        actual_sol_amount=float(sol_amount),
+                    )
+                except Exception:
+                    pass
+
             print("=== Scrapetech SEND BUY (Pump.fun) ===")
             print(f"USER: {args.user}")
             print(f"WALLET: {plan.user_pubkey}")
@@ -402,8 +659,8 @@ def main():
         # dump-buytx
         if args.ecmd == "dump-buytx":
             from .db import get_or_create_user
-            from .pump_tx import build_buy_ix_and_plan, ata_create_idempotent_ix, dump_ix_accounts
-            from .solana_rpc import get_http_client, rpc_get_multiple_accounts
+            from .pump_tx import ata_create_idempotent_ix
+            from .solana_rpc import rpc_get_multiple_accounts
         
             get_or_create_user(args.user)
             settings = get_user_settings(args.user)
@@ -456,6 +713,141 @@ def main():
         
             _dump(ata_ix, 0)
             _dump(buy_ix, 1)
+            return
+
+        # build-sell
+        if args.ecmd == "build-sell":
+            tokens_ui, tokens_raw, decimals = _resolve_sell_amount(
+                args.user, args.mint, args.pct, args.tokens
+            )
+            min_sol = _resolve_min_sol(args.min_sol, args.min_sol_lamports)
+
+            kp = load_keypair_for_user(args.user)
+            plan, _ix = build_sell_ix_and_plan(
+                user_keypair=kp,
+                mint_str=args.mint,
+                tokens_to_sell_raw=tokens_raw,
+                min_sol_output_lamports=min_sol,
+            )
+
+            print("=== Scrapetech Build Sell (Pump.fun) ===")
+            print(f"USER: {args.user}")
+            print(f"WALLET: {plan.user_pubkey}")
+            print(f"MINT: {plan.mint}")
+            print(f"TOKEN PROGRAM: {plan.token_program}")
+            print(f"BONDING CURVE: {plan.bonding_curve}")
+            print(f"ASSOCIATED USER: {plan.user_ata}")
+            print(f"TOKENS TO SELL (raw): {plan.tokens_to_sell_raw}")
+            print(f"TOKENS TO SELL (ui): {tokens_ui} (decimals={decimals})")
+            print(f"MIN SOL OUTPUT (lamports): {plan.min_sol_output_lamports}")
+            print("NO TRANSACTION SENT.")
+            return
+
+        # simulate-selltx
+        if args.ecmd == "simulate-selltx":
+            tokens_ui, tokens_raw, decimals = _resolve_sell_amount(
+                args.user, args.mint, args.pct, args.tokens
+            )
+            min_sol = _resolve_min_sol(args.min_sol, args.min_sol_lamports)
+
+            kp = load_keypair_for_user(args.user)
+            plan, sell_ix = build_sell_ix_and_plan(
+                user_keypair=kp,
+                mint_str=args.mint,
+                tokens_to_sell_raw=tokens_raw,
+                min_sol_output_lamports=min_sol,
+            )
+            sim = build_and_simulate_sell_tx(user_keypair=kp, sell_ix=sell_ix)
+
+            print("=== Scrapetech Simulate Sell TX (Pump.fun) ===")
+            print(f"USER: {args.user}")
+            print(f"WALLET: {plan.user_pubkey}")
+            print(f"MINT: {plan.mint}")
+            print(f"TOKENS TO SELL (raw): {plan.tokens_to_sell_raw}")
+            print(f"TOKENS TO SELL (ui): {tokens_ui} (decimals={decimals})")
+            print(f"MIN SOL OUTPUT (lamports): {plan.min_sol_output_lamports}")
+            print(f"SIM ERR: {sim.get('err')}")
+            logs = sim.get("logs")
+            if logs:
+                print("---- LOGS ----")
+                for line in logs:
+                    print(line)
+            print("NO TRANSACTION SENT.")
+            return
+
+        # send-sell (REAL SEND)
+        if args.ecmd == "send-sell":
+            tokens_ui, tokens_raw, decimals = _resolve_sell_amount(
+                args.user, args.mint, args.pct, args.tokens
+            )
+            min_sol = _resolve_min_sol(args.min_sol, args.min_sol_lamports)
+
+            kp = load_keypair_for_user(args.user)
+            plan, sell_ix = build_sell_ix_and_plan(
+                user_keypair=kp,
+                mint_str=args.mint,
+                tokens_to_sell_raw=tokens_raw,
+                min_sol_output_lamports=min_sol,
+            )
+            sig = send_sell_tx(user_keypair=kp, sell_ix=sell_ix)
+
+            enqueue_pending_trade(
+                args.user,
+                plan.mint,
+                "SELL",
+                sig,
+                requested_token_amount=float(tokens_ui),
+                requested_sol_amount=float(min_sol) / 1_000_000_000,
+            )
+
+            sol_amount = None
+            token_amount_ui = None
+            http = get_http_client()
+            for _ in range(6):
+                try:
+                    tx = rpc_get_transaction(http, sig)
+                    deltas = extract_tx_deltas(tx, plan.user_pubkey, plan.mint)
+                    sol_delta = deltas.get("sol_delta_lamports")
+                    token_delta_ui = deltas.get("token_delta_ui")
+                    if sol_delta is not None:
+                        sol_amount = sol_delta / 1_000_000_000
+                    if token_delta_ui is not None:
+                        token_amount_ui = abs(token_delta_ui)
+                    if sol_amount is not None and token_amount_ui is not None:
+                        break
+                except Exception:
+                    pass
+                time.sleep(2)
+
+            if sol_amount is not None and token_amount_ui is not None:
+                try:
+                    apply_trade(
+                        args.user,
+                        args.mint,
+                        "SELL",
+                        float(token_amount_ui),
+                        float(sol_amount),
+                        tx_sig=sig,
+                    )
+                    update_pending_trade_status(
+                        sig,
+                        "SUCCESS",
+                        actual_token_amount=float(token_amount_ui),
+                        actual_sol_amount=float(sol_amount),
+                    )
+                except Exception:
+                    pass
+
+            print("=== Scrapetech SEND SELL (Pump.fun) ===")
+            print(f"USER: {args.user}")
+            print(f"WALLET: {plan.user_pubkey}")
+            print(f"MINT: {plan.mint}")
+            print(f"TOKENS TO SELL (raw): {plan.tokens_to_sell_raw}")
+            print(f"TOKENS TO SELL (ui): {tokens_ui} (decimals={decimals})")
+            print(f"MIN SOL OUTPUT (lamports): {plan.min_sol_output_lamports}")
+            print(f"SIGNATURE: {sig}")
+            if sig:
+                print(f"SOLSCAN: https://solscan.io/tx/{sig}")
             return
 if __name__ == "__main__":
     main()

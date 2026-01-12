@@ -208,3 +208,80 @@ def rpc_get_multiple_accounts(client: httpx.Client, pubkeys: List[str]) -> List[
     for v in vals:
         out.append(v)  # v is dict or None
     return out
+
+def rpc_get_transaction(client: httpx.Client, signature: str) -> Dict[str, Any] | None:
+    r = client.post(
+        _rpc_url(),
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [
+                signature,
+                {
+                    "encoding": "jsonParsed",
+                    "maxSupportedTransactionVersion": 0,
+                },
+            ],
+        },
+    )
+    r.raise_for_status()
+    j = r.json()
+    return j.get("result")
+
+def extract_tx_deltas(tx: Dict[str, Any], owner_pubkey: str, mint: str) -> Dict[str, Any]:
+    if not tx or "meta" not in tx or "transaction" not in tx:
+        return {}
+
+    meta = tx["meta"] or {}
+    msg = tx["transaction"].get("message") or {}
+    keys = msg.get("accountKeys") or []
+
+    owner_index = None
+    for i, k in enumerate(keys):
+        if isinstance(k, dict):
+            pk = k.get("pubkey")
+        else:
+            pk = k
+        if pk == owner_pubkey:
+            owner_index = i
+            break
+
+    sol_delta_lamports = None
+    if owner_index is not None:
+        pre = meta.get("preBalances") or []
+        post = meta.get("postBalances") or []
+        if owner_index < len(pre) and owner_index < len(post):
+            sol_delta_lamports = int(post[owner_index]) - int(pre[owner_index])
+
+    def _pick_amounts(items):
+        raw = None
+        decimals = None
+        for it in items or []:
+            if it.get("owner") == owner_pubkey and it.get("mint") == mint:
+                ui = it.get("uiTokenAmount") or {}
+                raw = int(ui.get("amount") or 0)
+                decimals = int(ui.get("decimals") or 0)
+                break
+        return raw, decimals
+
+    pre_raw, pre_decimals = _pick_amounts(meta.get("preTokenBalances"))
+    post_raw, post_decimals = _pick_amounts(meta.get("postTokenBalances"))
+
+    if pre_raw is None:
+        pre_raw = 0
+    if post_raw is None:
+        post_raw = 0
+    decimals = post_decimals if post_decimals is not None else pre_decimals
+
+    token_delta_raw = int(post_raw) - int(pre_raw)
+    token_delta_ui = None
+    if decimals is not None:
+        token_delta_ui = token_delta_raw / (10 ** int(decimals))
+
+    return {
+        "sol_delta_lamports": sol_delta_lamports,
+        "token_delta_raw": token_delta_raw,
+        "token_delta_ui": token_delta_ui,
+        "token_decimals": decimals,
+    }
