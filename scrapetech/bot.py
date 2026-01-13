@@ -545,7 +545,7 @@ async def run_bot() -> None:
             _tag, mint, amount = data.split(":")
             if amount == "custom":
                 pending[user_id] = {"mode": "buy_amount_custom", "mint": mint}
-                await _safe_edit(event, "Custom amount selected.", buttons=_main_menu())
+                await _safe_edit(event, "Custom amount selected.", buttons=_buy_amount_presets(mint))
                 msg = await event.respond("Reply with custom SOL amount:", buttons=Button.force_reply())
                 pending[user_id]["prompt_id"] = msg.id
                 return
@@ -580,7 +580,7 @@ async def run_bot() -> None:
             _tag, action, mint, amt = data.split(":")
             if action == "buy":
                 sol = float(amt)
-                await _safe_edit(event, "Submitting buy...", buttons=_main_menu())
+                await _safe_edit(event, "Submitting buy...", buttons=_buy_amount_presets(mint))
                 sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
                 await event.respond(f"Buy submitted: {sig}")
                 return
