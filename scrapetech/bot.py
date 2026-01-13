@@ -72,11 +72,14 @@ def _wallet_menu():
 def _buy_amount_presets(mint: str):
     return [
         [
-            Button.inline("0.001 SOL", f"buyamt:{mint}:0.001".encode("utf-8")),
-            Button.inline("0.005 SOL", f"buyamt:{mint}:0.005".encode("utf-8")),
+            Button.inline("0.25 SOL", f"buyamt:{mint}:0.25".encode("utf-8")),
+            Button.inline("0.5 SOL", f"buyamt:{mint}:0.5".encode("utf-8")),
         ],
         [
-            Button.inline("0.01 SOL", f"buyamt:{mint}:0.01".encode("utf-8")),
+            Button.inline("1 SOL", f"buyamt:{mint}:1".encode("utf-8")),
+            Button.inline("2 SOL", f"buyamt:{mint}:2".encode("utf-8")),
+        ],
+        [
             Button.inline("Custom", f"buyamt:{mint}:custom".encode("utf-8")),
         ],
         [Button.inline("Back", b"menu:main")],
@@ -92,6 +95,7 @@ def _settings_menu(s):
     buy_amt = s.get("buy_amount_sol")
     buy_slip = s.get("buy_slippage_pct")
     sell_slip = s.get("sell_slippage_pct")
+    gas_fee = s.get("gas_fee_sol")
     tp_on = int(s.get("tp_sl_enabled", 1))
     tp = s.get("take_profit_pct")
     sl = s.get("stop_loss_pct")
@@ -108,6 +112,7 @@ def _settings_menu(s):
             Button.inline(f"Buy Slippage | {buy_slip}%", b"set:buy_slippage"),
             Button.inline(f"Sell Slippage | {sell_slip}%", b"set:sell_slippage"),
         ],
+        [Button.inline(f"Gas Fee | {gas_fee} SOL", b"set:gas_fee")],
         [Button.inline(tp_label, b"set:tp_sl_toggle")],
         [
             Button.inline(f"Take Profit | {tp}%", b"set:take_profit"),
@@ -591,6 +596,13 @@ async def run_bot() -> None:
             s = get_user_settings(user_id)
             await _safe_edit(event, "Sell slippage selected.", buttons=_settings_menu(s))
             msg = await event.respond("Reply with new sell slippage (%):", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
+            return
+        if data == "set:gas_fee":
+            pending[user_id] = {"mode": "setting_value", "field": "gas_fee_sol"}
+            s = get_user_settings(user_id)
+            await _safe_edit(event, "Gas fee selected.", buttons=_settings_menu(s))
+            msg = await event.respond("Reply with new gas fee (SOL):", buttons=Button.force_reply())
             pending[user_id]["prompt_id"] = msg.id
             return
         if data == "set:tp_sl_toggle":

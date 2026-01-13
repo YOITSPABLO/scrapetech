@@ -91,6 +91,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             buy_amount_sol REAL NOT NULL DEFAULT 0.001,
             buy_slippage_pct REAL NOT NULL DEFAULT 20.0,
             sell_slippage_pct REAL NOT NULL DEFAULT 20.0,
+            gas_fee_sol REAL NOT NULL DEFAULT 0.005,
             tp_sl_enabled INTEGER NOT NULL DEFAULT 1,
             take_profit_pct REAL NOT NULL DEFAULT 30.0,
             stop_loss_pct REAL NOT NULL DEFAULT 20.0,
@@ -103,6 +104,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         );
         """)
         _ensure_column(conn, "user_settings", "auto_buy_enabled", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "user_settings", "gas_fee_sol", "REAL NOT NULL DEFAULT 0.005")
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS trade_intents (
@@ -327,7 +329,7 @@ def update_user_settings(telegram_user_id: str, updates: dict, db_path: str = DE
 
     allowed = {
         "trade_mode","position_mode","max_open_positions",
-        "buy_amount_sol","buy_slippage_pct","sell_slippage_pct",
+        "buy_amount_sol","buy_slippage_pct","sell_slippage_pct","gas_fee_sol",
         "tp_sl_enabled","take_profit_pct","stop_loss_pct",
         "cooldown_seconds","max_trades_per_day","duplicate_mint_block",
         "auto_buy_enabled",
