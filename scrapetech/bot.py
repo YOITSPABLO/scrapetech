@@ -144,6 +144,7 @@ async def run_bot() -> None:
     await client.start(bot_token=token)
 
     pending = {}
+    last_mint = {}
 
     async def _safe_edit(event, text, buttons=None):
         try:
@@ -161,6 +162,12 @@ async def run_bot() -> None:
     @client.on(events.NewMessage(pattern=r"^/menu"))
     async def _menu(event):
         await event.respond("Main menu:", buttons=_main_menu())
+
+    @client.on(events.NewMessage(pattern=r"^/cancel"))
+    async def _cancel(event):
+        user_id = str(event.sender_id)
+        pending.pop(user_id, None)
+        await event.respond("Canceled. Back to main menu.", buttons=_main_menu())
 
     @client.on(events.NewMessage(pattern=r"^/status"))
     async def _status(event):
@@ -265,6 +272,11 @@ async def run_bot() -> None:
             return
         prompt_id = state.get("prompt_id")
         if prompt_id and event.message.reply_to_msg_id != prompt_id:
+            # allow mint detection even if waiting for a reply
+            mints = detect_mints(text)
+            if mints:
+                pending.pop(user_id, None)
+                await _send_mint_card(event, user_id, mints[0].mint)
             return
         if state.get("mode") == "buy":
             try:
@@ -392,6 +404,7 @@ async def run_bot() -> None:
             return
 
     async def _send_mint_card(event, user_id: str, mint: str):
+        last_mint[user_id] = mint
         s = get_user_settings(user_id)
         sol_in = float(s.get("buy_amount_sol") or 0.0)
         info_lines = [f"MINT: {mint}"]
@@ -425,7 +438,7 @@ async def run_bot() -> None:
                 [Button.inline("Sell Presets", f"sellpick:{mint}".encode("utf-8"))],
                 *buttons,
             ]
-        buttons.append([Button.inline("Main Menu", b"menu:main")])
+        buttons.append([Button.inline("Refresh", b"mint:refresh"), Button.inline("Main Menu", b"menu:main")])
         await event.respond("\n".join([l for l in info_lines if l]), buttons=buttons)
 
     @client.on(events.CallbackQuery)
@@ -499,6 +512,13 @@ async def run_bot() -> None:
                 "/import <secret>",
                 buttons=_main_menu(),
             )
+            return
+        if data == "mint:refresh":
+            mint = last_mint.get(user_id)
+            if not mint:
+                await _safe_edit(event, "No recent mint. Paste a CA.", buttons=_main_menu())
+                return
+            await _send_mint_card(event, user_id, mint)
             return
         if data == "menu:buy":
             pending[user_id] = {"mode": "buy_mint"}
