@@ -91,6 +91,12 @@ def _confirm_buttons(tag: str):
         [Button.inline("Cancel", b"menu:main")],
     ]
 
+def _retry_buy_buttons(mint: str, sol: float):
+    return [
+        [Button.inline("Retry (Buy)", f"retry_buy:{mint}:{sol}".encode("utf-8"))],
+        [Button.inline("Main Menu", b"menu:main")],
+    ]
+
 def _settings_menu(s):
     buy_amt = s.get("buy_amount_sol")
     buy_slip = s.get("buy_slippage_pct")
@@ -232,8 +238,15 @@ async def run_bot() -> None:
             return
 
         await event.respond("Submitting buy...")
-        sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
-        await event.respond(f"Buy submitted: {sig}")
+        try:
+            sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
+            await event.respond(f"Buy submitted: {sig}")
+        except Exception as e:
+            sol_in = sol if sol is not None else float(get_user_settings(user_id).get("buy_amount_sol") or 0.0)
+            await event.respond(
+                f"Buy failed.\nError: {e}",
+                buttons=_retry_buy_buttons(mint, sol_in),
+            )
 
     @client.on(events.NewMessage(pattern=r"^/sell"))
     async def _sell(event):
@@ -286,8 +299,15 @@ async def run_bot() -> None:
                 return
             pending.pop(user_id, None)
             await event.respond("Submitting buy...")
-            sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
-            await event.respond(f"Buy submitted: {sig}")
+            try:
+                sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
+                await event.respond(f"Buy submitted: {sig}")
+            except Exception as e:
+                sol_in = sol if sol is not None else float(get_user_settings(user_id).get("buy_amount_sol") or 0.0)
+                await event.respond(
+                    f"Buy failed.\nError: {e}",
+                    buttons=_retry_buy_buttons(mint, sol_in),
+                )
             return
 
         if state.get("mode") == "buy_mint":
@@ -581,8 +601,14 @@ async def run_bot() -> None:
             if action == "buy":
                 sol = float(amt)
                 await _safe_edit(event, "Submitting buy...", buttons=_buy_amount_presets(mint))
-                sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
-                await event.respond(f"Buy submitted: {sig}")
+                try:
+                    sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
+                    await event.respond(f"Buy submitted: {sig}")
+                except Exception as e:
+                    await event.respond(
+                        f"Buy failed.\nError: {e}",
+                        buttons=_retry_buy_buttons(mint, sol),
+                    )
                 return
             if action == "sell":
                 pct = float(amt)
@@ -597,6 +623,19 @@ async def run_bot() -> None:
                 await event.respond(f"Sell submitted: {sig}")
                 return
 
+        if data.startswith("retry_buy:"):
+            _tag, mint, sol_s = data.split(":")
+            sol = float(sol_s)
+            await _safe_edit(event, "Retrying buy...", buttons=_buy_amount_presets(mint))
+            try:
+                sig = await asyncio.to_thread(auto_buy_for_user, user_id, mint, sol)
+                await event.respond(f"Buy submitted: {sig}")
+            except Exception as e:
+                await event.respond(
+                    f"Buy failed.\nError: {e}",
+                    buttons=_retry_buy_buttons(mint, sol),
+                )
+            return
         if data == "set:buy_amount":
             pending[user_id] = {"mode": "setting_value", "field": "buy_amount_sol"}
             s = get_user_settings(user_id)
