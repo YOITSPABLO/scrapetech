@@ -305,7 +305,7 @@ def send_buy_tx(user_keypair: Keypair, mint_str: str, sol_in: float, slippage_pc
         "jsonrpc": "2.0",
         "id": 1,
         "method": "sendTransaction",
-        "params": [tx_b64, {"encoding":"base64","skipPreflight":True,"maxRetries":3,"preflightCommitment":"processed"}],
+        "params": [tx_b64, {"encoding":"base64","skipPreflight":False,"maxRetries":3,"preflightCommitment":"processed"}],
     }
     r = http.post(rpc_url, json=payload, timeout=30.0)
     j = r.json()

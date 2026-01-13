@@ -10,41 +10,82 @@ from .db import (
     get_position,
     list_positions,
     get_user_settings,
+    get_pending_trade,
+    reconcile_position_balance,
 )
 from .pump_tx import send_buy_tx, load_keypair_for_user
 from .pump_sell import build_sell_ix_and_plan, send_sell_tx
 from .solana_rpc import (
     get_http_client,
     rpc_get_transaction,
+    rpc_get_signature_status,
     extract_tx_deltas,
     try_get_mint_decimals,
     rpc_get_multiple_accounts,
+    rpc_get_token_balance_for_owner_mint,
+    rpc_get_token_balance_for_owner_mint_any,
 )
 from .pump_quotes import get_bonding_curve_pda, decode_bonding_curve_state
 
 
-def _wait_for_deltas(signature: str, owner_pubkey: str, mint: str, retries: int = 6, delay: int = 2):
+class TxFailed(Exception):
+    def __init__(self, sig: str, err: str):
+        super().__init__(f"Transaction failed: {err}")
+        self.sig = sig
+        self.err = err
+
+
+class TxPending(Exception):
+    def __init__(self, sig: str, note: str):
+        super().__init__(note)
+        self.sig = sig
+        self.note = note
+
+
+def _wait_for_receipt(
+    signature: str, owner_pubkey: str, mint: str, retries: int = 6, delay: int = 2
+):
     http = get_http_client()
+    confirmed_seen = False
     for _ in range(retries):
         try:
             tx = rpc_get_transaction(http, signature)
+            if tx and tx.get("meta") and tx["meta"].get("err"):
+                return None, None, str(tx["meta"]["err"])
+            if not tx:
+                status = rpc_get_signature_status(http, signature)
+                if status and status.get("err"):
+                    return None, None, str(status["err"])
+                if status and status.get("confirmationStatus") in ("processed", "confirmed", "finalized"):
+                    confirmed_seen = True
             deltas = extract_tx_deltas(tx, owner_pubkey=owner_pubkey, mint=mint)
             sol_delta = deltas.get("sol_delta_lamports")
             token_delta_ui = deltas.get("token_delta_ui")
             if sol_delta is not None and token_delta_ui is not None:
-                return sol_delta, token_delta_ui
+                return sol_delta, token_delta_ui, None
+            if tx and tx.get("meta") and not tx["meta"].get("err"):
+                return sol_delta, None, "MISSING_DELTAS"
         except Exception:
             pass
         time.sleep(delay)
-    return None, None
+    if confirmed_seen:
+        return None, None, "RECEIPT_PENDING"
+    return None, None, "Transaction not found on-chain"
 
 
-def auto_buy_for_user(telegram_user_id: str, mint: str, sol_in: Optional[float] = None) -> Optional[str]:
+def submit_buy_for_user(
+    telegram_user_id: str,
+    mint: str,
+    sol_in: Optional[float] = None,
+    slippage_pct: Optional[float] = None,
+    auto_buy_enabled: Optional[bool] = None,
+) -> tuple[str, str, str]:
     settings = get_user_settings(telegram_user_id)
-    if not int(settings.get("auto_buy_enabled", 1)):
+    enabled = int(settings.get("auto_buy_enabled", 1)) if auto_buy_enabled is None else int(auto_buy_enabled)
+    if not enabled:
         raise ValueError("Auto-buy is disabled for this user")
     sol_in = float(sol_in) if sol_in is not None else float(settings["buy_amount_sol"])
-    slippage = float(settings["buy_slippage_pct"])
+    slippage = float(slippage_pct) if slippage_pct is not None else float(settings["buy_slippage_pct"])
 
     kp = load_keypair_for_user(telegram_user_id)
     out = send_buy_tx(user_keypair=kp, mint_str=mint, sol_in=sol_in, slippage_pct=slippage)
@@ -64,21 +105,105 @@ def auto_buy_for_user(telegram_user_id: str, mint: str, sol_in: Optional[float] 
         requested_token_amount=req_tokens_ui,
         requested_sol_amount=sol_in,
     )
+    return sig, plan.user_pubkey, plan.mint
 
-    sol_delta, token_delta_ui = _wait_for_deltas(sig, plan.user_pubkey, plan.mint)
+
+def confirm_trade(
+    telegram_user_id: str,
+    signature: str,
+    mint: str,
+    owner_pubkey: str,
+    side: str,
+    retries: int = 15,
+    delay: int = 2,
+):
+    side = side.strip().upper()
+    if side not in ("BUY", "SELL"):
+        raise ValueError("side must be BUY or SELL")
+
+    sol_delta, token_delta_ui, err = _wait_for_receipt(signature, owner_pubkey, mint, retries=retries, delay=delay)
+    if err:
+        if err == "MISSING_DELTAS":
+            pending = get_pending_trade(signature)
+            sol_amount = abs(sol_delta) / 1_000_000_000 if sol_delta is not None else 0.0
+            if side == "BUY":
+                if pending and pending.get("requested_sol_amount"):
+                    sol_amount = float(pending["requested_sol_amount"])
+            try:
+                http = get_http_client()
+                onchain_bal = rpc_get_token_balance_for_owner_mint_any(http, owner_pubkey, mint)
+            except Exception:
+                onchain_bal = None
+
+            token_amount_ui = None
+            if onchain_bal is not None:
+                prev = get_position(telegram_user_id, mint)
+                prev_bal = float(prev["token_balance"]) if prev else 0.0
+                delta = float(onchain_bal) - prev_bal if side == "BUY" else prev_bal - float(onchain_bal)
+                if delta > 0:
+                    token_amount_ui = delta
+
+            if token_amount_ui is None and pending and pending.get("requested_token_amount"):
+                token_amount_ui = float(pending["requested_token_amount"])
+
+            if sol_amount > 0 and token_amount_ui and token_amount_ui > 0:
+                try:
+                    apply_trade(telegram_user_id, mint, side, token_amount_ui, sol_amount, tx_sig=signature)
+                    update_pending_trade_status(
+                        signature,
+                        "SUCCESS",
+                        actual_token_amount=token_amount_ui,
+                        actual_sol_amount=sol_amount,
+                    )
+                    return {
+                        "status": "SUCCESS",
+                        "signature": signature,
+                        "token_amount": token_amount_ui,
+                        "sol_amount": sol_amount,
+                    }
+                except Exception:
+                    pass
+            return {"status": "PENDING", "signature": signature, "error": "Missing token deltas"}
+        if err == "RECEIPT_PENDING":
+            return {"status": "PENDING", "signature": signature, "error": None}
+        update_pending_trade_status(signature, "FAILED", error=err)
+        return {"status": "FAILED", "signature": signature, "error": err}
+
     if sol_delta is not None and token_delta_ui is not None:
         sol_amount = abs(sol_delta) / 1_000_000_000
         token_amount_ui = abs(token_delta_ui)
         try:
-            apply_trade(telegram_user_id, plan.mint, "BUY", token_amount_ui, sol_amount, tx_sig=sig)
+            apply_trade(telegram_user_id, mint, side, token_amount_ui, sol_amount, tx_sig=signature)
             update_pending_trade_status(
-                sig,
+                signature,
                 "SUCCESS",
                 actual_token_amount=token_amount_ui,
                 actual_sol_amount=sol_amount,
             )
+            http = get_http_client()
+            onchain_bal = rpc_get_token_balance_for_owner_mint_any(http, owner_pubkey, mint)
+            if onchain_bal is not None:
+                reconcile_position_balance(telegram_user_id, mint, float(onchain_bal))
         except Exception:
             pass
+        return {
+            "status": "SUCCESS",
+            "signature": signature,
+            "token_amount": token_amount_ui,
+            "sol_amount": sol_amount,
+        }
+
+    return {"status": "PENDING", "signature": signature, "error": None}
+
+
+def auto_buy_for_user(telegram_user_id: str, mint: str, sol_in: Optional[float] = None) -> Optional[str]:
+    sig, owner_pubkey, mint = submit_buy_for_user(telegram_user_id, mint, sol_in=sol_in)
+
+    res = confirm_trade(telegram_user_id, sig, mint, owner_pubkey, "BUY")
+    if res.get("status") == "FAILED":
+        raise TxFailed(sig, res.get("error") or "Unknown error")
+    if res.get("status") == "PENDING":
+        raise TxPending(sig, "Transaction submitted; awaiting receipt")
 
     return sig
 
@@ -105,7 +230,9 @@ def _current_price_sol_per_token(mint: str) -> Optional[float]:
     return (st.virtual_sol_reserves / 1_000_000_000) / st.virtual_token_reserves
 
 
-def auto_sell_for_position(telegram_user_id: str, mint: str, tokens_ui: float) -> Optional[str]:
+def submit_sell_for_user(
+    telegram_user_id: str, mint: str, tokens_ui: float
+) -> tuple[str, str, str]:
     decimals = try_get_mint_decimals(mint)
     if decimals is None:
         raise ValueError("Could not determine mint decimals for sell sizing")
@@ -130,21 +257,16 @@ def auto_sell_for_position(telegram_user_id: str, mint: str, tokens_ui: float) -
         requested_token_amount=tokens_ui,
         requested_sol_amount=0.0,
     )
+    return sig, plan.user_pubkey, plan.mint
 
-    sol_delta, token_delta_ui = _wait_for_deltas(sig, plan.user_pubkey, plan.mint)
-    if sol_delta is not None and token_delta_ui is not None:
-        sol_amount = abs(sol_delta) / 1_000_000_000
-        token_amount_ui = abs(token_delta_ui)
-        try:
-            apply_trade(telegram_user_id, plan.mint, "SELL", token_amount_ui, sol_amount, tx_sig=sig)
-            update_pending_trade_status(
-                sig,
-                "SUCCESS",
-                actual_token_amount=token_amount_ui,
-                actual_sol_amount=sol_amount,
-            )
-        except Exception:
-            pass
+def auto_sell_for_position(telegram_user_id: str, mint: str, tokens_ui: float) -> Optional[str]:
+    sig, owner_pubkey, mint = submit_sell_for_user(telegram_user_id, mint, tokens_ui)
+
+    res = confirm_trade(telegram_user_id, sig, mint, owner_pubkey, "SELL")
+    if res.get("status") == "FAILED":
+        raise TxFailed(sig, res.get("error") or "Unknown error")
+    if res.get("status") == "PENDING":
+        raise TxPending(sig, "Transaction submitted; awaiting receipt")
 
     return sig
 

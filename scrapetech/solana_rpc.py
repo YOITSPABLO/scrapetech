@@ -6,6 +6,8 @@ from solana.rpc.api import Client
 from solders.pubkey import Pubkey
 
 LAMPORTS_PER_SOL = 1_000_000_000
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM_ID = "TokenzQdYmf8s5w1Qx9r1v6A9F9Fj7X1n1rX5Yp4sQj"
 
 def get_rpc_url() -> str:
     url = os.getenv("SOLANA_RPC_URL", "").strip()
@@ -229,6 +231,168 @@ def rpc_get_transaction(client: httpx.Client, signature: str) -> Dict[str, Any] 
     j = r.json()
     return j.get("result")
 
+def rpc_get_signature_status(client: httpx.Client, signature: str) -> Dict[str, Any] | None:
+    r = client.post(
+        _rpc_url(),
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [[signature], {"searchTransactionHistory": True}],
+        },
+    )
+    r.raise_for_status()
+    j = r.json()
+    vals = j.get("result", {}).get("value") or []
+    return vals[0] if vals else None
+
+def rpc_get_token_balance_for_owner_mint(
+    client: httpx.Client, owner_pubkey: str, mint: str
+) -> float | None:
+    r = client.post(
+        _rpc_url(),
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                owner_pubkey,
+                {"mint": mint},
+                {"encoding": "jsonParsed"},
+            ],
+        },
+    )
+    r.raise_for_status()
+    j = r.json()
+    vals = j.get("result", {}).get("value") or []
+    total = 0.0
+    for v in vals:
+        data = v.get("account", {}).get("data", {})
+        parsed = data.get("parsed", {})
+        info = parsed.get("info", {})
+        tok = info.get("tokenAmount", {})
+        try:
+            ui_amt = tok.get("uiAmount")
+            if ui_amt is None:
+                ui_amt = tok.get("uiAmountString")
+            amt = float(ui_amt or 0.0)
+        except Exception:
+            amt = 0.0
+        total += amt
+    return total
+
+def rpc_get_token_accounts_by_owner(client: httpx.Client, owner_pubkey: str) -> list[dict]:
+    def _fetch(program_id: str) -> list[dict]:
+        r = client.post(
+            _rpc_url(),
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    owner_pubkey,
+                    {"programId": program_id},
+                    {"encoding": "jsonParsed"},
+                ],
+            },
+        )
+        r.raise_for_status()
+        j = r.json()
+        return j.get("result", {}).get("value") or []
+
+    accounts = []
+    for pid in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+        try:
+            accounts.extend(_fetch(pid))
+        except Exception:
+            continue
+
+    totals: dict[str, dict] = {}
+    for v in accounts:
+        data = v.get("account", {}).get("data", {})
+        parsed = data.get("parsed", {})
+        info = parsed.get("info", {})
+        mint = info.get("mint")
+        tok = info.get("tokenAmount", {})
+        try:
+            decimals = int(tok.get("decimals") or 0)
+        except Exception:
+            decimals = 0
+        try:
+            ui_amt = tok.get("uiAmount")
+            if ui_amt is None:
+                ui_amt = tok.get("uiAmountString")
+            if ui_amt is None:
+                raw = tok.get("amount")
+                if raw is not None:
+                    ui_amt = float(raw) / (10 ** int(decimals))
+            amt = float(ui_amt or 0.0)
+        except Exception:
+            amt = 0.0
+        if not mint:
+            continue
+        cur = totals.get(mint)
+        if not cur:
+            totals[mint] = {"mint": mint, "ui_amount": amt, "decimals": decimals}
+        else:
+            cur["ui_amount"] += amt
+
+    return sorted(totals.values(), key=lambda x: x["ui_amount"], reverse=True)
+
+def rpc_get_assets_by_owner(client: httpx.Client, owner_pubkey: str, page: int = 1, limit: int = 200) -> list[dict]:
+    r = client.post(
+        _rpc_url(),
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAssetsByOwner",
+            "params": {
+                "ownerAddress": owner_pubkey,
+                "page": int(page),
+                "limit": int(limit),
+                "displayOptions": {"showFungible": True},
+            },
+        },
+    )
+    r.raise_for_status()
+    j = r.json()
+    items = j.get("result", {}).get("items") or []
+    out = []
+    for it in items:
+        if it.get("interface") != "FungibleToken":
+            continue
+        token = it.get("token_info") or {}
+        mint = it.get("id")
+        decimals = int(token.get("decimals") or 0)
+        raw_bal = token.get("balance")
+        ui_amt = None
+        try:
+            if raw_bal is not None:
+                ui_amt = float(raw_bal) / (10 ** int(decimals))
+        except Exception:
+            ui_amt = None
+        if mint and ui_amt is not None:
+            out.append({"mint": mint, "ui_amount": ui_amt, "decimals": decimals})
+    return sorted(out, key=lambda x: x["ui_amount"], reverse=True)
+
+def rpc_get_token_balance_for_owner_mint_any(
+    client: httpx.Client, owner_pubkey: str, mint: str
+) -> float | None:
+    try:
+        bal = rpc_get_token_balance_for_owner_mint(client, owner_pubkey, mint)
+        if bal and bal > 0:
+            return bal
+    except Exception:
+        pass
+    try:
+        assets = rpc_get_assets_by_owner(client, owner_pubkey)
+        for it in assets:
+            if it.get("mint") == mint:
+                return float(it.get("ui_amount") or 0.0)
+    except Exception:
+        pass
+    return None
+
 def extract_tx_deltas(tx: Dict[str, Any], owner_pubkey: str, mint: str) -> Dict[str, Any]:
     if not tx or "meta" not in tx or "transaction" not in tx:
         return {}
@@ -254,24 +418,23 @@ def extract_tx_deltas(tx: Dict[str, Any], owner_pubkey: str, mint: str) -> Dict[
         if owner_index < len(pre) and owner_index < len(post):
             sol_delta_lamports = int(post[owner_index]) - int(pre[owner_index])
 
-    def _pick_amounts(items):
-        raw = None
+    def _sum_amounts(items):
+        total_raw = 0
         decimals = None
         for it in items or []:
             if it.get("owner") == owner_pubkey and it.get("mint") == mint:
                 ui = it.get("uiTokenAmount") or {}
-                raw = int(ui.get("amount") or 0)
-                decimals = int(ui.get("decimals") or 0)
-                break
-        return raw, decimals
+                total_raw += int(ui.get("amount") or 0)
+                if decimals is None:
+                    try:
+                        decimals = int(ui.get("decimals") or 0)
+                    except Exception:
+                        decimals = None
+        return total_raw, decimals
 
-    pre_raw, pre_decimals = _pick_amounts(meta.get("preTokenBalances"))
-    post_raw, post_decimals = _pick_amounts(meta.get("postTokenBalances"))
+    pre_raw, pre_decimals = _sum_amounts(meta.get("preTokenBalances"))
+    post_raw, post_decimals = _sum_amounts(meta.get("postTokenBalances"))
 
-    if pre_raw is None:
-        pre_raw = 0
-    if post_raw is None:
-        post_raw = 0
     decimals = post_decimals if post_decimals is not None else pre_decimals
 
     token_delta_raw = int(post_raw) - int(pre_raw)

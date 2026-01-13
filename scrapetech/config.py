@@ -1,8 +1,16 @@
 from dataclasses import dataclass
 import os
 from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+_HERE = Path(__file__).resolve().parent
+_CANDIDATES = [_HERE / ".env", _HERE.parent / ".env"]
+for _p in _CANDIDATES:
+    if _p.exists():
+        load_dotenv(dotenv_path=_p)
+        break
+else:
+    load_dotenv()
 
 @dataclass(frozen=True)
 class Settings:

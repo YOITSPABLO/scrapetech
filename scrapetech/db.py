@@ -95,6 +95,9 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             tp_sl_enabled INTEGER NOT NULL DEFAULT 1,
             take_profit_pct REAL NOT NULL DEFAULT 30.0,
             stop_loss_pct REAL NOT NULL DEFAULT 20.0,
+            max_marketcap_sol REAL,
+            min_holders INTEGER,
+            degen_mode INTEGER NOT NULL DEFAULT 0,
             cooldown_seconds INTEGER NOT NULL DEFAULT 60,
             max_trades_per_day INTEGER NOT NULL DEFAULT 20,
             duplicate_mint_block INTEGER NOT NULL DEFAULT 1,
@@ -105,6 +108,10 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         """)
         _ensure_column(conn, "user_settings", "auto_buy_enabled", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "user_settings", "gas_fee_sol", "REAL NOT NULL DEFAULT 0.005")
+        _ensure_column(conn, "user_settings", "confirm_tx_enabled", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "user_settings", "max_marketcap_sol", "REAL")
+        _ensure_column(conn, "user_settings", "min_holders", "INTEGER")
+        _ensure_column(conn, "user_settings", "degen_mode", "INTEGER NOT NULL DEFAULT 0")
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS trade_intents (
@@ -124,6 +131,30 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         """)
 
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS channel_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            buy_amount_sol REAL,
+            buy_slippage_pct REAL,
+            sell_slippage_pct REAL,
+            gas_fee_sol REAL,
+            tp_sl_enabled INTEGER,
+            take_profit_pct REAL,
+            stop_loss_pct REAL,
+            max_marketcap_sol REAL,
+            min_holders INTEGER,
+            auto_buy_enabled INTEGER,
+            degen_mode INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, channel_id),
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(channel_id) REFERENCES channels(id)
+        );
+        """)
+
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS auto_mint_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -131,6 +162,13 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             first_auto_buy_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, mint),
             FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS listener_status (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         """)
 
@@ -293,12 +331,79 @@ def list_subscriptions(telegram_user_id: str, db_path: str = DEFAULT_DB_PATH):
             SELECT c.handle, s.status, s.created_at
             FROM subscriptions s
             JOIN channels c ON c.id = s.channel_id
-            WHERE s.user_id=?
+            WHERE s.user_id=? AND s.status!='DELETED'
             ORDER BY c.handle
             """,
             (user["id"],),
         ).fetchall()
         return rows
+
+def upsert_channel_settings(telegram_user_id: str, channel_handle: str, updates: dict, db_path: str = DEFAULT_DB_PATH):
+    user_id = get_or_create_user(telegram_user_id, db_path=db_path)
+    channel_id = get_or_create_channel(channel_handle, db_path=db_path)
+    init_db(db_path)
+
+    allowed = {
+        "buy_amount_sol","buy_slippage_pct","sell_slippage_pct","gas_fee_sol",
+        "tp_sl_enabled","take_profit_pct","stop_loss_pct",
+        "max_marketcap_sol","min_holders",
+        "auto_buy_enabled","degen_mode",
+    }
+    bad = [k for k in updates.keys() if k not in allowed]
+    if bad:
+        raise ValueError(f"Unknown channel settings keys: {bad}")
+
+    sets = ", ".join([f"{k}=?" for k in updates.keys()])
+    vals = list(updates.values())
+    vals.extend([user_id, channel_id])
+
+    with connect(db_path) as conn:
+        conn.execute(
+            f"""
+            INSERT INTO channel_settings (user_id, channel_id, {", ".join(updates.keys())})
+            VALUES (?, ?, {", ".join(["?"] * len(updates))})
+            ON CONFLICT(user_id, channel_id) DO UPDATE SET
+                {sets}, updated_at=CURRENT_TIMESTAMP
+            """,
+            [user_id, channel_id] + list(updates.values()),
+        )
+
+def get_channel_settings(telegram_user_id: str, channel_handle: str, db_path: str = DEFAULT_DB_PATH):
+    user_id = get_or_create_user(telegram_user_id, db_path=db_path)
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT cs.*
+            FROM channel_settings cs
+            JOIN channels c ON c.id = cs.channel_id
+            WHERE cs.user_id=? AND c.handle=?
+            """,
+            (user_id, channel_handle),
+        ).fetchone()
+        return dict(row) if row else {}
+
+def clear_channel_settings(telegram_user_id: str, channel_handle: str, db_path: str = DEFAULT_DB_PATH):
+    user_id = get_or_create_user(telegram_user_id, db_path=db_path)
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            DELETE FROM channel_settings
+            WHERE user_id=? AND channel_id=(SELECT id FROM channels WHERE handle=?)
+            """,
+            (user_id, channel_handle),
+        )
+
+def get_effective_settings(telegram_user_id: str, channel_handle: str, db_path: str = DEFAULT_DB_PATH):
+    base = get_user_settings(telegram_user_id, db_path=db_path)
+    overrides = get_channel_settings(telegram_user_id, channel_handle, db_path=db_path)
+    for key, val in overrides.items():
+        if key in ("id", "user_id", "channel_id", "created_at", "updated_at"):
+            continue
+        if val is not None:
+            base[key] = val
+    return base
 
 def active_subscribers_for_channel(channel_handle: str, db_path: str = DEFAULT_DB_PATH):
     init_db(db_path)
@@ -311,11 +416,55 @@ def active_subscribers_for_channel(channel_handle: str, db_path: str = DEFAULT_D
             SELECT u.telegram_user_id
             FROM subscriptions s
             JOIN users u ON u.id = s.user_id
+            JOIN wallets w ON w.user_id = u.id
             WHERE s.channel_id=? AND s.status='ACTIVE'
             """,
             (chan["id"],),
         ).fetchall()
         return [r["telegram_user_id"] for r in rows]
+
+def list_active_channels(db_path: str = DEFAULT_DB_PATH) -> list[str]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT c.handle
+            FROM subscriptions s
+            JOIN channels c ON c.id = s.channel_id
+            WHERE s.status='ACTIVE'
+            ORDER BY c.handle
+            """
+        ).fetchall()
+        return [r["handle"] for r in rows]
+
+def update_listener_heartbeat(db_path: str = DEFAULT_DB_PATH) -> None:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO listener_status (id, last_seen)
+            VALUES (1, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP
+            """
+        )
+
+def get_listener_last_seen(db_path: str = DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT last_seen FROM listener_status WHERE id=1").fetchone()
+        return row["last_seen"] if row else None
+
+def cleanup_subscriptions_without_wallet(db_path: str = DEFAULT_DB_PATH) -> int:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM subscriptions
+            WHERE user_id NOT IN (SELECT user_id FROM wallets)
+              AND status!='DELETED'
+            """
+        )
+        return cur.rowcount
 
 def ensure_user_settings(telegram_user_id: str, db_path: str = DEFAULT_DB_PATH) -> None:
     user_id = get_or_create_user(telegram_user_id, db_path=db_path)
@@ -331,8 +480,9 @@ def update_user_settings(telegram_user_id: str, updates: dict, db_path: str = DE
         "trade_mode","position_mode","max_open_positions",
         "buy_amount_sol","buy_slippage_pct","sell_slippage_pct","gas_fee_sol",
         "tp_sl_enabled","take_profit_pct","stop_loss_pct",
+        "max_marketcap_sol","min_holders","degen_mode",
         "cooldown_seconds","max_trades_per_day","duplicate_mint_block",
-        "auto_buy_enabled",
+        "auto_buy_enabled","confirm_tx_enabled",
     }
     bad = [k for k in updates.keys() if k not in allowed]
     if bad:
@@ -394,11 +544,15 @@ def get_position(telegram_user_id: str, mint: str, db_path: str = DEFAULT_DB_PAT
     user_id = get_or_create_user(telegram_user_id, db_path=db_path)
     init_db(db_path)
     with connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM positions WHERE user_id=? AND (open=0 OR token_balance<=0)",
+            (user_id,),
+        )
         row = conn.execute(
             """
             SELECT *
             FROM positions
-            WHERE user_id=? AND mint=?
+            WHERE user_id=? AND mint=? AND open=1 AND token_balance>0
             """,
             (user_id, mint),
         ).fetchone()
@@ -408,11 +562,15 @@ def list_positions(telegram_user_id: str, db_path: str = DEFAULT_DB_PATH):
     user_id = get_or_create_user(telegram_user_id, db_path=db_path)
     init_db(db_path)
     with connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM positions WHERE user_id=? AND (open=0 OR token_balance<=0)",
+            (user_id,),
+        )
         rows = conn.execute(
             """
             SELECT *
             FROM positions
-            WHERE user_id=?
+            WHERE user_id=? AND open=1 AND token_balance>0
             ORDER BY mint
             """,
             (user_id,),
@@ -473,7 +631,8 @@ def apply_trade(
             new_total_spent = total_spent
             new_total_received = total_received + sol_amount
             new_realized_pnl = realized_pnl + pnl
-            if new_balance <= epsilon:
+            close_threshold = max(epsilon, 500.0)
+            if new_balance <= close_threshold:
                 new_balance = 0.0
                 new_avg_entry = 0.0
                 open_flag = 0
@@ -491,18 +650,24 @@ def apply_trade(
         )
 
         if row:
-            conn.execute(
-                """
-                UPDATE positions
-                SET token_balance=?, avg_entry_sol=?, total_sol_spent=?, total_sol_received=?,
-                    realized_pnl_sol=?, open=?, updated_at=CURRENT_TIMESTAMP
-                WHERE user_id=? AND mint=?
-                """,
-                (
-                    new_balance, new_avg_entry, new_total_spent, new_total_received,
-                    new_realized_pnl, open_flag, user_id, mint,
-                ),
-            )
+            if open_flag == 0:
+                conn.execute(
+                    "DELETE FROM positions WHERE user_id=? AND mint=?",
+                    (user_id, mint),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE positions
+                    SET token_balance=?, avg_entry_sol=?, total_sol_spent=?, total_sol_received=?,
+                        realized_pnl_sol=?, open=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE user_id=? AND mint=?
+                    """,
+                    (
+                        new_balance, new_avg_entry, new_total_spent, new_total_received,
+                        new_realized_pnl, open_flag, user_id, mint,
+                    ),
+                )
         else:
             conn.execute(
                 """
@@ -598,3 +763,37 @@ def list_pending_trades(status: str | None = "PENDING", limit: int = 50, db_path
                 (int(limit),),
             ).fetchall()
         return [dict(r) for r in rows]
+
+def get_pending_trade(signature: str, db_path: str = DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM pending_trades WHERE signature=?",
+            (signature,),
+        ).fetchone()
+        return dict(row) if row else None
+
+def reconcile_position_balance(
+    telegram_user_id: str,
+    mint: str,
+    token_balance: float,
+    db_path: str = DEFAULT_DB_PATH,
+):
+    user_id = get_or_create_user(telegram_user_id, db_path=db_path)
+    init_db(db_path)
+    with connect(db_path) as conn:
+        close_threshold = 500.0
+        if token_balance <= close_threshold:
+            conn.execute(
+                "DELETE FROM positions WHERE user_id=? AND mint=?",
+                (user_id, mint),
+            )
+            return
+        conn.execute(
+            """
+            UPDATE positions
+            SET token_balance=?, open=1, updated_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND mint=?
+            """,
+            (token_balance, user_id, mint),
+        )
