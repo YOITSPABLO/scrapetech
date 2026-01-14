@@ -1,5 +1,8 @@
 import os
 import asyncio
+import base58
+import re
+from telethon.tl.types import MessageEntitySpoiler
 from typing import Optional
 
 from telethon import TelegramClient, events, Button
@@ -17,7 +20,14 @@ from .db import (
     clear_channel_settings,
     get_listener_last_seen,
 )
-from .wallets import wallet_get_pubkey, wallet_create, wallet_import
+from .wallets import (
+    wallet_get_pubkey,
+    wallet_get_keypair,
+    wallet_create,
+    wallet_import,
+    wallet_list,
+    wallet_set_default,
+)
 from .auto_trader import (
     TxFailed,
     TxPending,
@@ -37,6 +47,7 @@ from .solana_rpc import (
     rpc_get_assets_by_owner,
     sol_balance,
 )
+from .tx_errors import format_tx_error
 
 
 def _get_bot_token() -> str:
@@ -74,6 +85,66 @@ def _main_menu():
         [Button.inline("ℹ️ Help", b"menu:help")],
     ]
 
+def _main_status_text(user_id: str) -> str:
+    pub = wallet_get_pubkey(user_id)
+    wallet_line = "Wallet: not set"
+    if pub:
+        name = None
+        for w in wallet_list(user_id):
+            if w.is_default:
+                name = w.name
+                break
+        _, sol = sol_balance(pub)
+        short = f"{pub[:4]}...{pub[-4:]}"
+        wallet_label = f"{name} {short}" if name else short
+        wallet_line = f"Wallet: {wallet_label} | SOL: {sol:.4f}"
+    last_seen = get_listener_last_seen()
+    listener_line = f"Listener: {last_seen}" if last_seen else "Listener: unknown"
+    return (
+        "🟢 Scrapetech • Main\n"
+        "\n"
+        f"{wallet_line}\n"
+        f"{listener_line}\n"
+        "\n"
+        "Choose an action:"
+    )
+
+_DEFAULT_BUY_PRESETS = [0.25, 0.5, 1.0, 2.0]
+_DEFAULT_SELL_PRESETS = [10.0, 25.0, 50.0, 100.0]
+
+def _parse_preset_list(raw: str, min_val: float, max_val: float, max_items: int = 6) -> list[float]:
+    parts = [p for p in re.split(r"[,\s]+", raw.strip()) if p]
+    out: list[float] = []
+    for p in parts:
+        val = float(p)
+        if val < min_val or val > max_val:
+            continue
+        out.append(val)
+        if len(out) >= max_items:
+            break
+    return out
+
+def _format_preset_list(vals: list[float]) -> str:
+    return ", ".join([f"{v:g}" for v in vals])
+
+def _get_buy_presets(user_id: str) -> list[float]:
+    s = get_user_settings(user_id)
+    raw = (s.get("buy_presets_sol") or "").strip()
+    try:
+        presets = _parse_preset_list(raw, 0.0001, 100.0, max_items=6)
+    except Exception:
+        presets = []
+    return presets if presets else _DEFAULT_BUY_PRESETS
+
+def _get_sell_presets(user_id: str) -> list[float]:
+    s = get_user_settings(user_id)
+    raw = (s.get("sell_presets_pct") or "").strip()
+    try:
+        presets = _parse_preset_list(raw, 1.0, 100.0, max_items=6)
+    except Exception:
+        presets = []
+    return presets if presets else _DEFAULT_SELL_PRESETS
+
 def _reconcile_positions(user_id: str, rows):
     pubkey = wallet_get_pubkey(user_id)
     if not pubkey:
@@ -106,13 +177,21 @@ def _wallet_overview_lines(user_id: str, limit: int = 10):
     pubkey = wallet_get_pubkey(user_id)
     if not pubkey:
         return None, []
+    name = None
+    for w in wallet_list(user_id):
+        if w.is_default:
+            name = w.name
+            break
     _, sol = sol_balance(pubkey)
     http = get_http_client()
     tokens = rpc_get_token_accounts_by_owner(http, pubkey)
     tokens = [t for t in tokens if float(t.get("ui_amount") or 0.0) > 0]
     if not tokens:
         tokens = rpc_get_assets_by_owner(http, pubkey)
-    lines = [f"💼 Wallet\n{pubkey}", f"SOL: {sol:.6f}"]
+    header = f"💼 Wallet\n{pubkey}"
+    if name:
+        header = f"💼 Wallet ({name})\n{pubkey}"
+    lines = [header, f"SOL: {sol:.6f}"]
     if not tokens:
         lines.append("Tokens: none")
         return pubkey, lines
@@ -144,42 +223,61 @@ def _wallet_tokens_buttons(user_id: str, limit: int = 10):
     return buttons
 
 
-def _sell_presets(mint: str):
-    return [
-        [
-            Button.inline("🔻 Sell 10%", f"sell:{mint}:10".encode("utf-8")),
-            Button.inline("🔻 Sell 25%", f"sell:{mint}:25".encode("utf-8")),
-        ],
-        [
-            Button.inline("🔻 Sell 50%", f"sell:{mint}:50".encode("utf-8")),
-            Button.inline("🔻 Sell 100%", f"sell:{mint}:100".encode("utf-8")),
-        ],
-        [Button.inline("⬅️ Back", b"menu:main")],
-    ]
+def _sell_presets(user_id: str, mint: str):
+    presets = _get_sell_presets(user_id)
+    rows = []
+    for i in range(0, len(presets), 2):
+        chunk = presets[i : i + 2]
+        row = []
+        for pct in chunk:
+            label = f"🔻 Sell {pct:g}%"
+            row.append(Button.inline(label, f"sell:{mint}:{pct}".encode("utf-8")))
+        rows.append(row)
+    rows.append([Button.inline("⬅️ Back", b"menu:main")])
+    return rows
 
 def _wallet_menu():
     return [
         [Button.inline("💠 Wallet Overview", b"wallet:overview")],
+        [Button.inline("🧰 Manage Wallets", b"wallets:manage")],
         [Button.inline("🧬 Generate Wallet", b"wallet:generate")],
         [Button.inline("🔑 Import Wallet", b"wallet:import")],
+        [Button.inline("🕶️ Reveal Key", b"wallet:reveal")],
         [Button.inline("⬅️ Back", b"menu:main")],
     ]
 
-def _buy_amount_presets(mint: str):
+def _wallet_list_buttons(user_id: str):
+    wallets = wallet_list(user_id)
+    if not wallets:
+        return [[Button.inline("⬅️ Back", b"menu:wallet")]]
+    rows = []
+    for w in wallets:
+        prefix = "✅ " if w.is_default else ""
+        label = f"{prefix}{w.name} {w.pubkey[:6]}..."
+        rows.append([Button.inline(label, f"wallet:select:{w.id}".encode("utf-8"))])
+    rows.append([Button.inline("⬅️ Back", b"menu:wallet")])
+    return rows
+
+def _wallet_actions_buttons(wallet_id: int):
     return [
-        [
-            Button.inline("⚡ 0.25 SOL", f"buyamt:{mint}:0.25".encode("utf-8")),
-            Button.inline("⚡ 0.5 SOL", f"buyamt:{mint}:0.5".encode("utf-8")),
-        ],
-        [
-            Button.inline("⚡ 1 SOL", f"buyamt:{mint}:1".encode("utf-8")),
-            Button.inline("⚡ 2 SOL", f"buyamt:{mint}:2".encode("utf-8")),
-        ],
-        [
-            Button.inline("✍️ Custom", f"buyamt:{mint}:custom".encode("utf-8")),
-        ],
-        [Button.inline("⬅️ Back", b"menu:main")],
+        [Button.inline("✅ Set Default", f"wallet:set_default:{wallet_id}".encode("utf-8"))],
+        [Button.inline("🕶️ Reveal Key", f"wallet:reveal:{wallet_id}".encode("utf-8"))],
+        [Button.inline("⬅️ Back", b"wallets:manage")],
     ]
+
+def _buy_amount_presets(user_id: str, mint: str):
+    presets = _get_buy_presets(user_id)
+    rows = []
+    for i in range(0, len(presets), 2):
+        chunk = presets[i : i + 2]
+        row = []
+        for sol in chunk:
+            label = f"⚡ {sol:g} SOL"
+            row.append(Button.inline(label, f"buyamt:{mint}:{sol}".encode("utf-8")))
+        rows.append(row)
+    rows.append([Button.inline("✍️ Custom", f"buyamt:{mint}:custom".encode("utf-8"))])
+    rows.append([Button.inline("⬅️ Back", b"menu:main")])
+    return rows
 
 def _confirm_buttons(tag: str):
     return [
@@ -195,6 +293,16 @@ def _retry_buy_buttons(mint: str, sol: float):
 
 def _tx_link(sig: str) -> str:
     return f"https://solscan.io/tx/{sig}"
+
+def _md_escape(text: str) -> str:
+    chars = r"_*[]()~`>#+-=|{}.!\\"
+    out = []
+    for ch in text:
+        if ch in chars:
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
 
 def _fmt_override(val, default):
     return f"{val}" if val is not None else f"default({default})"
@@ -217,9 +325,27 @@ def _settings_menu(s):
     confirm_label = "🛰️ Confirm Tx ✅" if confirm_tx else "🛰️ Confirm Tx ❌"
     degen_label = "🧪 Degen ✅" if degen else "🧪 Degen ❌"
     dup_label = "🧱 Duplicate Buy ⛔" if dup_block else "🧱 Duplicate Buy ✅"
+    try:
+        buy_presets = _format_preset_list(
+            _parse_preset_list(str(s.get("buy_presets_sol") or ""), 0.0001, 100.0)
+        )
+    except Exception:
+        buy_presets = ""
+    try:
+        sell_presets = _format_preset_list(
+            _parse_preset_list(str(s.get("sell_presets_pct") or ""), 1.0, 100.0)
+        )
+    except Exception:
+        sell_presets = ""
+    if not buy_presets:
+        buy_presets = _format_preset_list(_DEFAULT_BUY_PRESETS)
+    if not sell_presets:
+        sell_presets = _format_preset_list(_DEFAULT_SELL_PRESETS)
 
     return [
         [Button.inline(f"⚡ Buy Amount | {buy_amt} SOL", b"set:buy_amount")],
+        [Button.inline(f"⚡ Buy Presets | {buy_presets}", b"set:buy_presets")],
+        [Button.inline(f"🔻 Sell Presets | {sell_presets}", b"set:sell_presets")],
         [
             Button.inline(f"🧪 Buy Slippage | {buy_slip}%", b"set:buy_slippage"),
             Button.inline(f"🧪 Sell Slippage | {sell_slip}%", b"set:sell_slippage"),
@@ -297,12 +423,19 @@ async def run_bot() -> None:
 
     pending = {}
     last_mint = {}
+    selected_wallet = {}
 
     async def _safe_edit(event, text, buttons=None):
         try:
             await event.edit(text, buttons=buttons)
         except MessageNotModifiedError:
             await event.respond(text, buttons=buttons)
+
+    async def _safe_edit_entities(event, text, entities, buttons=None):
+        try:
+            await event.edit(text, formatting_entities=entities, buttons=buttons)
+        except MessageNotModifiedError:
+            await event.respond(text, formatting_entities=entities, buttons=buttons)
 
     async def _confirm_and_notify(chat_id, user_id, mint, owner_pubkey, sig, side, notify: bool):
         link = _tx_link(sig)
@@ -320,7 +453,7 @@ async def run_bot() -> None:
                 )
             except Exception as e:
                 if notify:
-                    await client.send_message(chat_id, f"{side} status check failed.\nError: {e}")
+                    await client.send_message(chat_id, f"{side} status check failed.\nReason: {format_tx_error(e)}")
                 return
 
             status = res.get("status")
@@ -337,7 +470,8 @@ async def run_bot() -> None:
                         detail = f"\nSOL={sol_amt:.6f} | TOKENS={tok_amt:.6f}"
                     await client.send_message(chat_id, f"{side} confirmed.{detail}\nTx: {link}")
                 elif status == "FAILED":
-                    await client.send_message(chat_id, f"{side} failed.\nError: {res.get('error')}\nTx: {link}")
+                    err = format_tx_error(res.get("error"))
+                    await client.send_message(chat_id, f"{side} failed.\nReason: {err}\nTx: {link}")
             return
 
         if notify:
@@ -345,14 +479,13 @@ async def run_bot() -> None:
 
     @client.on(events.NewMessage(pattern=r"^/start"))
     async def _start(event):
-        await event.respond(
-            "🟢 Scrapetech • Auto-Trader\nUse the menu below.",
-            buttons=_main_menu(),
-        )
+        user_id = str(event.sender_id)
+        await event.respond(_main_status_text(user_id), buttons=_main_menu())
 
     @client.on(events.NewMessage(pattern=r"^/menu"))
     async def _menu(event):
-        await event.respond("🟢 Scrapetech • Main", buttons=_main_menu())
+        user_id = str(event.sender_id)
+        await event.respond(_main_status_text(user_id), buttons=_main_menu())
 
     @client.on(events.NewMessage(pattern=r"^/cancel"))
     async def _cancel(event):
@@ -380,11 +513,18 @@ async def run_bot() -> None:
     @client.on(events.NewMessage(pattern=r"^/wallet"))
     async def _wallet(event):
         user_id = str(event.sender_id)
-        pub = wallet_get_pubkey(user_id)
-        if not pub:
+        wallets = wallet_list(user_id)
+        if not wallets:
             await event.respond("No wallet found.", buttons=_wallet_menu())
             return
-        await event.respond(f"wallet={pub}", buttons=_wallet_menu())
+        default = next((w for w in wallets if w.is_default), None)
+        if default:
+            await event.respond(
+                f"default={default.name}\nwallet={default.pubkey}",
+                buttons=_wallet_menu(),
+            )
+            return
+        await event.respond(f"wallet={wallets[0].pubkey}", buttons=_wallet_menu())
 
     @client.on(events.NewMessage(pattern=r"^/import"))
     async def _import(event):
@@ -396,7 +536,11 @@ async def run_bot() -> None:
         secret = parts[1].strip()
         try:
             rec = wallet_import(user_id, secret)
-            await event.respond(f"WALLET OK: {rec.pubkey}", buttons=_wallet_menu())
+            default_note = " (default)" if rec.is_default else ""
+            await event.respond(
+                f"WALLET OK: {rec.name}{default_note}\n{rec.pubkey}",
+                buttons=_wallet_menu(),
+            )
         except Exception as e:
             await event.respond(f"Import failed: {e}", buttons=_wallet_menu())
 
@@ -431,7 +575,7 @@ async def run_bot() -> None:
         except Exception as e:
             sol_in = sol if sol is not None else float(get_user_settings(user_id).get("buy_amount_sol") or 0.0)
             await event.respond(
-                f"Buy failed.\nError: {e}",
+                f"Buy failed.\nReason: {format_tx_error(e)}",
                 buttons=_retry_buy_buttons(mint, sol_in),
             )
 
@@ -492,7 +636,7 @@ async def run_bot() -> None:
             except Exception as e:
                 sol_in = sol if sol is not None else float(get_user_settings(user_id).get("buy_amount_sol") or 0.0)
                 await event.respond(
-                    f"Buy failed.\nError: {e}",
+                    f"Buy failed.\nReason: {format_tx_error(e)}",
                     buttons=_retry_buy_buttons(mint, sol_in),
                 )
             return
@@ -503,7 +647,10 @@ async def run_bot() -> None:
                 await event.respond("Reply with a mint address.")
                 return
             pending[user_id] = {"mode": "buy_amount", "mint": mint}
-            await event.respond(f"Select buy amount for {mint}:", buttons=_buy_amount_presets(mint))
+            await event.respond(
+                f"Select buy amount for {mint}:",
+                buttons=_buy_amount_presets(user_id, mint),
+            )
             return
 
         if state.get("mode") == "sell":
@@ -534,7 +681,11 @@ async def run_bot() -> None:
             pending.pop(user_id, None)
             try:
                 rec = wallet_import(user_id, secret)
-                await event.respond(f"WALLET OK: {rec.pubkey}", buttons=_wallet_menu())
+                default_note = " (default)" if rec.is_default else ""
+                await event.respond(
+                    f"WALLET OK: {rec.name}{default_note}\n{rec.pubkey}",
+                    buttons=_wallet_menu(),
+                )
             except Exception as e:
                 await event.respond(f"Import failed: {e}", buttons=_wallet_menu())
             return
@@ -565,7 +716,7 @@ async def run_bot() -> None:
                     _confirm_and_notify(event.chat_id, user_id, mint, owner_pubkey, sig, "BUY", notify)
                 )
             except Exception as e:
-                await event.respond(f"Buy failed.\nError: {e}")
+                await event.respond(f"Buy failed.\nReason: {format_tx_error(e)}")
             return
 
         if state.get("mode") == "sell_pct_custom":
@@ -603,7 +754,7 @@ async def run_bot() -> None:
                     _confirm_and_notify(event.chat_id, user_id, mint, owner_pubkey, sig, "SELL", notify)
                 )
             except Exception as e:
-                await event.respond(f"Sell failed.\nError: {e}")
+                await event.respond(f"Sell failed.\nReason: {format_tx_error(e)}")
             return
 
         if state.get("mode") == "setting_value":
@@ -619,6 +770,30 @@ async def run_bot() -> None:
                 update_user_settings(user_id, updates)
                 s = get_user_settings(user_id)
                 await event.respond("Settings updated.", buttons=_settings_menu(s))
+            except Exception as e:
+                s = get_user_settings(user_id)
+                await event.respond(f"Update failed: {e}", buttons=_settings_menu(s))
+            return
+
+        if state.get("mode") == "setting_presets":
+            field = state.get("field")
+            raw = event.raw_text.strip()
+            pending.pop(user_id, None)
+            try:
+                if field == "buy_presets_sol":
+                    presets = _parse_preset_list(raw, 0.0001, 100.0, max_items=6)
+                else:
+                    presets = _parse_preset_list(raw, 1.0, 100.0, max_items=6)
+            except Exception:
+                presets = []
+            if not presets:
+                await event.respond("Send a comma-separated list (e.g., 0.25,0.5,1,2).")
+                return
+            updates = {field: ",".join([f"{v:g}" for v in presets])}
+            try:
+                update_user_settings(user_id, updates)
+                s = get_user_settings(user_id)
+                await event.respond("Presets updated.", buttons=_settings_menu(s))
             except Exception as e:
                 s = get_user_settings(user_id)
                 await event.respond(f"Update failed: {e}", buttons=_settings_menu(s))
@@ -699,7 +874,7 @@ async def run_bot() -> None:
 
         rows = list_positions(user_id)
         has_pos = any(r["mint"] == mint and float(r["token_balance"]) > 0 for r in rows)
-        buttons = _buy_amount_presets(mint)
+        buttons = _buy_amount_presets(user_id, mint)
         if has_pos:
             buttons = [
                 [Button.inline("Sell Presets", f"sellpick:{mint}".encode("utf-8"))],
@@ -714,12 +889,47 @@ async def run_bot() -> None:
         data = event.data.decode("utf-8")
 
         if data == "menu:main":
-            await event.edit("🟢 Scrapetech • Main", buttons=_main_menu())
+            await event.edit(_main_status_text(user_id), buttons=_main_menu())
             return
         if data == "menu:wallet":
             pub = wallet_get_pubkey(user_id)
-            text = f"💼 Wallet\n{pub}" if pub else "💼 Wallet\nNo wallet found."
+            if not pub:
+                await event.edit("💼 Wallet\nNo wallet found.", buttons=_wallet_menu())
+                return
+            name = None
+            for w in wallet_list(user_id):
+                if w.is_default:
+                    name = w.name
+                    break
+            _, sol = sol_balance(pub)
+            header = f"💼 Wallet\n{pub}"
+            if name:
+                header = f"💼 Wallet ({name})\n{pub}"
+            text = f"{header}\nSOL: {sol:.6f}"
             await event.edit(text, buttons=_wallet_menu())
+            return
+        if data == "wallets:manage":
+            await _safe_edit(event, "🧰 Wallets", buttons=_wallet_list_buttons(user_id))
+            return
+        if data.startswith("wallet:select:"):
+            wallet_id = int(data.split(":")[2])
+            wallets = {w.id: w for w in wallet_list(user_id)}
+            w = wallets.get(wallet_id)
+            if not w:
+                await _safe_edit(event, "Wallet not found.", buttons=_wallet_list_buttons(user_id))
+                return
+            selected_wallet[user_id] = wallet_id
+            label = f"{w.name} {w.pubkey}"
+            await _safe_edit(event, f"Wallet selected:\n{label}", buttons=_wallet_actions_buttons(wallet_id))
+            return
+        if data.startswith("wallet:set_default:"):
+            wallet_id = int(data.split(":")[2])
+            try:
+                wallet_set_default(user_id, wallet_id)
+            except Exception as e:
+                await _safe_edit(event, f"Set default failed: {e}", buttons=_wallet_list_buttons(user_id))
+                return
+            await _safe_edit(event, "Default wallet updated.", buttons=_wallet_list_buttons(user_id))
             return
         if data == "wallet:overview":
             pub, lines = _wallet_overview_lines(user_id)
@@ -732,17 +942,19 @@ async def run_bot() -> None:
             await _safe_edit(event, "Generating wallet...", buttons=_wallet_menu())
             try:
                 out = wallet_create(user_id)
-                await event.respond(
+                default_note = " (default)" if out.get("is_default") else ""
+                header = (
                     "Wallet created.\n"
+                    f"name={out['name']}{default_note}\n"
                     f"pubkey={out['pubkey']}\n\n"
-                    "Backup options:\n"
-                    f"1) Phantom secret key (base58):\n{out['phantom_secret_base58']}\n\n"
-                    f"2) Phantom secret key (JSON):\n{out['phantom_secret_json']}\n\n"
-                    f"3) Seed (base58):\n{out['seed_base58']}",
-                    buttons=_wallet_menu(),
+                    "Backup (Phantom secret key base58) — tap to reveal:\n"
                 )
+                secret = out["phantom_secret_base58"]
+                text = header + secret
+                entities = [MessageEntitySpoiler(offset=len(header), length=len(secret))]
+                await _safe_edit_entities(event, text, entities, buttons=_wallet_menu())
             except Exception as e:
-                await event.respond(f"Generate failed: {e}", buttons=_wallet_menu())
+                await _safe_edit(event, f"Generate failed: {e}", buttons=_wallet_menu())
             return
         if data == "wallet:import":
             pending[user_id] = {"mode": "import_wallet"}
@@ -750,11 +962,35 @@ async def run_bot() -> None:
             msg = await event.respond("Reply with the secret key or seed to import:", buttons=Button.force_reply())
             pending[user_id]["prompt_id"] = msg.id
             return
+        if data.startswith("wallet:reveal"):
+            wallet_id = None
+            parts = data.split(":")
+            if len(parts) == 3:
+                wallet_id = int(parts[2])
+            if wallet_id is None and not wallet_get_pubkey(user_id):
+                await _safe_edit(event, "No wallet found.", buttons=_wallet_menu())
+                return
+            try:
+                kp = wallet_get_keypair(user_id, wallet_id=wallet_id)
+                secret64 = bytes(kp)
+                secret58 = base58.b58encode(secret64).decode("utf-8")
+            except Exception as e:
+                await event.respond(f"Reveal failed: {e}", buttons=_wallet_menu())
+                return
+            header = (
+                "⚠️ Your private key is hidden below. Tap to reveal.\n"
+                "Never share this with anyone.\n\n"
+                "Secret (base58): "
+            )
+            text = header + secret58
+            entities = [MessageEntitySpoiler(offset=len(header), length=len(secret58))]
+            await _safe_edit_entities(event, text, entities, buttons=_wallet_menu())
+            return
         if data.startswith("wallet_sell:"):
             mint = data.split(":", 1)[1]
             bal = _get_onchain_token_balance(user_id, mint)
             bal_line = f"Balance: {bal:.6f}" if bal is not None else "Balance: unknown"
-            await _safe_edit(event, f"Sell presets for {mint}:\n{bal_line}", buttons=_sell_presets(mint))
+            await _safe_edit(event, f"Sell presets for {mint}:\n{bal_line}", buttons=_sell_presets(user_id, mint))
             return
         if data == "menu:positions":
             rows = list_positions(user_id)
@@ -785,13 +1021,10 @@ async def run_bot() -> None:
         if data == "menu:help":
             await _safe_edit(
                 event,
-                "Commands:\n"
-                "/buy <mint> [sol]\n"
-                "/sell <mint> <pct>\n"
-                "/positions\n"
-                "/status\n"
-                "/wallet\n"
-                "/import <secret>",
+                "Scrapetech helps you trade pump tokens from Telegram.\n"
+                "Use Channels to add call groups, then set your auto‑buy settings.\n"
+                "Paste a mint to get a token card with buy/sell buttons and positions.\n"
+                "Wallet lets you generate/import and manage keys safely.",
                 buttons=_main_menu(),
             )
             return
@@ -816,7 +1049,7 @@ async def run_bot() -> None:
                 return
             if len(open_rows) == 1:
                 mint = open_rows[0]["mint"]
-                await _safe_edit(event, f"Sell presets for {mint}:", buttons=_sell_presets(mint))
+                await _safe_edit(event, f"Sell presets for {mint}:", buttons=_sell_presets(user_id, mint))
                 return
             buttons = [[Button.inline(r["mint"][:8], f"sellpick:{r['mint']}".encode("utf-8"))] for r in open_rows]
             buttons.append([Button.inline("Back", b"menu:main")])
@@ -827,7 +1060,7 @@ async def run_bot() -> None:
             _tag, mint, amount = data.split(":")
             if amount == "custom":
                 pending[user_id] = {"mode": "buy_amount_custom", "mint": mint}
-                await _safe_edit(event, "Custom amount selected.", buttons=_buy_amount_presets(mint))
+                await _safe_edit(event, "Custom amount selected.", buttons=_buy_amount_presets(user_id, mint))
                 msg = await event.respond("Reply with custom SOL amount:", buttons=Button.force_reply())
                 pending[user_id]["prompt_id"] = msg.id
                 return
@@ -840,7 +1073,7 @@ async def run_bot() -> None:
                     buttons=_confirm_buttons(f"buy:{mint}:{sol}"),
                 )
                 return
-            await _safe_edit(event, "Submitting buy...", buttons=_buy_amount_presets(mint))
+            await _safe_edit(event, "Submitting buy...", buttons=_buy_amount_presets(user_id, mint))
             try:
                 sig, owner_pubkey, mint = await asyncio.to_thread(
                     submit_buy_for_user, user_id, mint, sol
@@ -852,14 +1085,14 @@ async def run_bot() -> None:
                     )
             except Exception as e:
                 await event.respond(
-                    f"Buy failed.\nError: {e}",
+                    f"Buy failed.\nReason: {format_tx_error(e)}",
                     buttons=_retry_buy_buttons(mint, sol),
                 )
             return
 
         if data.startswith("sellpick:"):
             mint = data.split(":", 1)[1]
-            await _safe_edit(event, f"Sell presets for {mint}:", buttons=_sell_presets(mint))
+            await _safe_edit(event, f"Sell presets for {mint}:", buttons=_sell_presets(user_id, mint))
             return
         if data.startswith("sell:"):
             _tag, mint, pct_s = data.split(":")
@@ -892,14 +1125,14 @@ async def run_bot() -> None:
                         _confirm_and_notify(event.chat_id, user_id, mint, owner_pubkey, sig, "SELL")
                     )
             except Exception as e:
-                await event.respond(f"Sell failed.\nError: {e}")
+                await event.respond(f"Sell failed.\nReason: {format_tx_error(e)}")
             return
 
         if data.startswith("confirm:"):
             _tag, action, mint, amt = data.split(":")
             if action == "buy":
                 sol = float(amt)
-                await _safe_edit(event, "Submitting buy...", buttons=_buy_amount_presets(mint))
+                await _safe_edit(event, "Submitting buy...", buttons=_buy_amount_presets(user_id, mint))
                 try:
                     sig, owner_pubkey, mint = await asyncio.to_thread(
                         submit_buy_for_user, user_id, mint, sol
@@ -912,7 +1145,7 @@ async def run_bot() -> None:
                     )
                 except Exception as e:
                     await event.respond(
-                        f"Buy failed.\nError: {e}",
+                        f"Buy failed.\nReason: {format_tx_error(e)}",
                         buttons=_retry_buy_buttons(mint, sol),
                     )
                 return
@@ -936,13 +1169,13 @@ async def run_bot() -> None:
                         _confirm_and_notify(event.chat_id, user_id, mint, owner_pubkey, sig, "SELL", notify)
                     )
                 except Exception as e:
-                    await event.respond(f"Sell failed.\nError: {e}")
+                    await event.respond(f"Sell failed.\nReason: {format_tx_error(e)}")
                 return
 
         if data.startswith("retry_buy:"):
             _tag, mint, sol_s = data.split(":")
             sol = float(sol_s)
-            await _safe_edit(event, "Retrying buy...", buttons=_buy_amount_presets(mint))
+            await _safe_edit(event, "Retrying buy...", buttons=_buy_amount_presets(user_id, mint))
             try:
                 sig, owner_pubkey, mint = await asyncio.to_thread(
                     submit_buy_for_user, user_id, mint, sol
@@ -955,7 +1188,7 @@ async def run_bot() -> None:
                 )
             except Exception as e:
                 await event.respond(
-                    f"Buy failed.\nError: {e}",
+                    f"Buy failed.\nReason: {format_tx_error(e)}",
                     buttons=_retry_buy_buttons(mint, sol),
                 )
             return
@@ -964,6 +1197,26 @@ async def run_bot() -> None:
             s = get_user_settings(user_id)
             await _safe_edit(event, "Buy amount selected.", buttons=_settings_menu(s))
             msg = await event.respond("Reply with new buy amount (SOL):", buttons=Button.force_reply())
+            pending[user_id]["prompt_id"] = msg.id
+            return
+        if data == "set:buy_presets":
+            pending[user_id] = {"mode": "setting_presets", "field": "buy_presets_sol"}
+            s = get_user_settings(user_id)
+            await _safe_edit(event, "Buy presets selected.", buttons=_settings_menu(s))
+            msg = await event.respond(
+                "Reply with buy presets (comma-separated SOL, e.g., 0.25,0.5,1,2):",
+                buttons=Button.force_reply(),
+            )
+            pending[user_id]["prompt_id"] = msg.id
+            return
+        if data == "set:sell_presets":
+            pending[user_id] = {"mode": "setting_presets", "field": "sell_presets_pct"}
+            s = get_user_settings(user_id)
+            await _safe_edit(event, "Sell presets selected.", buttons=_settings_menu(s))
+            msg = await event.respond(
+                "Reply with sell presets (comma-separated %, e.g., 10,25,50,100):",
+                buttons=Button.force_reply(),
+            )
             pending[user_id]["prompt_id"] = msg.id
             return
         if data == "set:buy_slippage":

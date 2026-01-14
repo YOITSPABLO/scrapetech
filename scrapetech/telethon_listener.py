@@ -22,6 +22,7 @@ from .db import (
 )
 from .auto_trader import submit_buy_for_user, confirm_trade
 from .solana_rpc import get_http_client, rpc_get_token_balance_for_owner_mint_any
+from .tx_errors import format_tx_error
 from .wallets import wallet_get_pubkey
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -187,7 +188,8 @@ async def run_listen(channel: str) -> None:
                         if status == "SUCCESS":
                             _notify_bot(user_id, f"Auto-buy confirmed.\nTx: {_tx_link(sig)}")
                         elif status == "FAILED":
-                            _notify_bot(user_id, f"Auto-buy failed.\nError: {res.get('error')}\nTx: {_tx_link(sig)}")
+                            err = format_tx_error(res.get("error"))
+                            _notify_bot(user_id, f"Auto-buy failed.\nReason: {err}\nTx: {_tx_link(sig)}")
                     log.info("AUTO_BUY queued: user=%s mint=%s", user_id, mint)
                 except Exception as e:
                     msg = str(e)
@@ -369,7 +371,8 @@ async def run_listen_all(poll_seconds: int = 10) -> None:
                         if status == "SUCCESS":
                             _notify_bot(user_id, f"Auto-buy confirmed.\nTx: {_tx_link(sig)}")
                         elif status == "FAILED":
-                            _notify_bot(user_id, f"Auto-buy failed.\nError: {res.get('error')}\nTx: {_tx_link(sig)}")
+                            err = format_tx_error(res.get("error"))
+                            _notify_bot(user_id, f"Auto-buy failed.\nReason: {err}\nTx: {_tx_link(sig)}")
                     log.info("AUTO_BUY queued: user=%s mint=%s", user_id, mint)
                 except Exception as e:
                     msg = str(e)
@@ -379,7 +382,7 @@ async def run_listen_all(poll_seconds: int = 10) -> None:
                             f"Auto-buy failed.\nReason: Bonding curve complete (migrated to Raydium).\nMint: {mint}",
                         )
                     else:
-                        _notify_bot(user_id, f"Auto-buy failed.\nError: {e}\nMint: {mint}")
+                        _notify_bot(user_id, f"Auto-buy failed.\nReason: {format_tx_error(e)}\nMint: {mint}")
                     log.error("AUTO_BUY failed: user=%s mint=%s err=%s", user_id, mint, e)
 
             for u in users:

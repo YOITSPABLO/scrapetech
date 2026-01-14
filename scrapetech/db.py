@@ -112,6 +112,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         _ensure_column(conn, "user_settings", "max_marketcap_sol", "REAL")
         _ensure_column(conn, "user_settings", "min_holders", "INTEGER")
         _ensure_column(conn, "user_settings", "degen_mode", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "user_settings", "buy_presets_sol", "TEXT NOT NULL DEFAULT '0.25,0.5,1,2'")
+        _ensure_column(conn, "user_settings", "sell_presets_pct", "TEXT NOT NULL DEFAULT '10,25,50,100'")
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS trade_intents (
@@ -181,6 +183,23 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             salt BLOB NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            pubkey TEXT NOT NULL,
+            enc_secret BLOB NOT NULL,
+            salt BLOB NOT NULL,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, name),
+            UNIQUE(user_id, pubkey),
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
         """)
@@ -483,6 +502,7 @@ def update_user_settings(telegram_user_id: str, updates: dict, db_path: str = DE
         "max_marketcap_sol","min_holders","degen_mode",
         "cooldown_seconds","max_trades_per_day","duplicate_mint_block",
         "auto_buy_enabled","confirm_tx_enabled",
+        "buy_presets_sol","sell_presets_pct",
     }
     bad = [k for k in updates.keys() if k not in allowed]
     if bad:
